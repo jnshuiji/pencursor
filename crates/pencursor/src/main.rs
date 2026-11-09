@@ -1,13 +1,12 @@
 //! PenCursor cross-platform binary entrypoint.
 //!
 //! Dispatches execution to the target platform runtime backend (`WindowsRuntime` on Windows,
-//! or the Android KernelSU daemon backend on Android targets).
+//! or `AndroidRuntime` on Android KernelSU daemon targets).
 
-use pencursor_core::Config;
+use pencursor_core::{Config, PlatformRuntime};
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use pencursor_core::PlatformRuntime;
     use pencursor_windows::WindowsRuntime;
 
     let config = Config::default();
@@ -15,9 +14,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _config = Config::default();
-    eprintln!("[PenCursor] 当前 Target 非 Windows 平台，Android KernelSU Daemon Backend 待接入。");
+    use pencursor_android::AndroidRuntime;
+
+    let config = Config::default();
+    AndroidRuntime::run(config)?;
     Ok(())
 }

@@ -1,0 +1,3 @@
+[target.aarch64-linux-android]
+linker = "/home/pochita/.local/share/mise/installs/android-sdk/23.0/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android37-clang"
+rustflags = ["-C", "target-feature=+neon"]

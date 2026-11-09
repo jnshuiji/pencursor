@@ -59,10 +59,10 @@ impl PlatformRuntime for WindowsRuntime {
         println!("  PenCursor - 高性能 Stylus Cursor Overlay 服务");
         println!("========================================================");
         println!("• 全局捕获：双轨 RawInput (HID Digitizer + Absolute Mouse)");
-        println!("• 极低延迟：DXGI 单帧队列 + DirectComposition 零拷贝合成");
+        println!("• 极低延迟：DXGI 1-Frame Latency + DirectComposition Zero-Copy 合成");
         println!("• 智能感知：Stylus Hover 唤醒，Mouse 移动自动休眠");
-        println!("• 触碰收敛：Contact 瞬间收缩微点，Hover 时高对比度矢量对齐");
-        println!("• 退出方式：按 Ctrl+C 或关闭本窗口");
+        println!("• 触碰收敛：Contact 瞬间收缩微点，Hover 时高对比度 Vector 对齐");
+        println!("• 退出方式：按 Ctrl+C 或关闭窗口");
         println!("--------------------------------------------------------");
 
         let _hook_guard = MouseHookGuard::start()?;

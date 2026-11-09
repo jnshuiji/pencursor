@@ -1,0 +1,15 @@
+[package]
+name = "pencursor-android"
+description = "Android KernelSU daemon backend for PenCursor (epoll/inotify evdev, tiny-skia dual 64x64 SurfaceControl sprite overlay, and USB power governor)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pencursor-core.workspace = true
+tiny-skia.workspace = true
+
+[lints]
+workspace = true

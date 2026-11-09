@@ -17,5 +17,8 @@ pencursor-core.workspace = true
 [target.'cfg(windows)'.dependencies]
 pencursor-windows.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+pencursor-android.workspace = true
+
 [lints]
 workspace = true

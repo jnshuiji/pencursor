@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/pencursor-core",
     "crates/pencursor-windows",
+    "crates/pencursor-android",
     "crates/pencursor",
 ]
 default-members = ["crates/pencursor"]
@@ -17,6 +18,8 @@ repository = "https://github.com/jnshuiji/pencursor"
 [workspace.dependencies]
 pencursor-core = { path = "crates/pencursor-core" }
 pencursor-windows = { path = "crates/pencursor-windows" }
+pencursor-android = { path = "crates/pencursor-android" }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 windows-numerics = "0.3"
 
 [workspace.dependencies.windows]
