@@ -1,38 +1,11 @@
-//! Coordinate space normalization and vector cursor primitive geometry.
+//! Coordinate space normalization and vector cursor primitive geometry built on Linebender `kurbo`.
 //!
 //! Provides platform-independent mapping from hardware digitizer axis ranges
 //! (e.g., Win32 HID logical bounds or Linux `evdev` `ABS_X`/`ABS_Y` ranges) to display
-//! viewports, alongside precomputed geometric descriptors for cursor rendering.
+//! viewports, alongside precomputed `kurbo` shapes (`Circle`, `Line`, `Stroke`) for cursor rendering.
 
 use crate::config::Config;
-
-/// 2D floating-point coordinate in screen or viewport space.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Point2f {
-    pub x: f32,
-    pub y: f32,
-}
-
-impl Point2f {
-    #[inline]
-    pub const fn new(x: f32, y: f32) -> Self {
-        Self { x, y }
-    }
-}
-
-/// 2D line segment defined by start and end points.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct LineSegment2f {
-    pub start: Point2f,
-    pub end: Point2f,
-}
-
-impl LineSegment2f {
-    #[inline]
-    pub const fn new(start: Point2f, end: Point2f) -> Self {
-        Self { start, end }
-    }
-}
+use vello_cpu::kurbo::{Cap, Circle, Line, Point, Rect, Stroke};
 
 /// Target display or virtual desktop viewport rectangle in global pixel coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,10 +31,22 @@ impl ViewportBounds {
         }
     }
 
-    /// Transforms global screen coordinates into viewport-local coordinates.
+    /// Converts the viewport bounds into a [`Rect`].
     #[inline]
-    pub const fn to_local(self, global_x: f32, global_y: f32) -> Point2f {
-        Point2f::new(global_x - self.origin_x, global_y - self.origin_y)
+    pub fn to_rect(self) -> Rect {
+        Rect::from_origin_size(
+            (f64::from(self.origin_x), f64::from(self.origin_y)),
+            (f64::from(self.width), f64::from(self.height)),
+        )
+    }
+
+    /// Transforms global screen coordinates into viewport-local [`Point`] coordinates.
+    #[inline]
+    pub fn to_local(self, global_x: f32, global_y: f32) -> Point {
+        Point::new(
+            f64::from(global_x - self.origin_x),
+            f64::from(global_y - self.origin_y),
+        )
     }
 }
 
@@ -93,108 +78,106 @@ impl DeviceAxisRange {
         Self::new(0.0, max_x, 0.0, max_y)
     }
 
-    /// Maps raw hardware axis values linearly into global pixel coordinates within `viewport`.
+    /// Maps raw hardware axis values linearly into global pixel coordinates `(x, y)` within `viewport`.
     #[inline]
-    pub fn map_to_viewport(self, raw_x: f32, raw_y: f32, viewport: ViewportBounds) -> Point2f {
+    pub fn map_to_viewport(self, raw_x: f32, raw_y: f32, viewport: ViewportBounds) -> (f32, f32) {
         let span_x = (self.max_x - self.min_x).max(1.0);
         let span_y = (self.max_y - self.min_y).max(1.0);
 
         let norm_x = ((raw_x - self.min_x) / span_x).clamp(0.0, 1.0);
         let norm_y = ((raw_y - self.min_y) / span_y).clamp(0.0, 1.0);
 
-        Point2f::new(
+        (
             viewport.origin_x + norm_x * viewport.width,
             viewport.origin_y + norm_y * viewport.height,
         )
     }
 }
 
-/// Precomputed geometric parameters for rendering the crosshair cursor.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Precomputed `kurbo` geometric shapes and stroke styles for rendering the crosshair cursor.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CrosshairPrimitives {
-    pub center: Point2f,
-    pub arms: [LineSegment2f; 4],
-    pub inner_thickness: f32,
-    pub outline_thickness: f32,
-    pub center_dot_radius: f32,
+    pub center: Point,
+    pub arms: [Line; 4],
+    pub inner_stroke: Stroke,
+    pub outline_stroke: Stroke,
+    pub center_dot: Circle,
 }
 
 impl CrosshairPrimitives {
-    /// Computes crosshair arm segments and stroke widths centered at `center`.
+    /// Computes `kurbo` crosshair arm lines, strokes, and center dot centered at `center`.
     #[inline]
-    pub fn compute(center: Point2f, config: &Config) -> Self {
+    pub fn compute(center: Point, config: &Config) -> Self {
         let px = center.x;
         let py = center.y;
         let gap = config.crosshair_gap;
         let size = config.crosshair_size;
-        let inner_thickness = config.crosshair_thickness;
-        let outline_thickness = inner_thickness + 1.6;
+        let inner_width = config.crosshair_thickness;
+        let outline_width = inner_width + 1.6;
 
         let arms = [
             // Top arm
-            LineSegment2f::new(Point2f::new(px, py - gap - size), Point2f::new(px, py - gap)),
+            Line::new(Point::new(px, py - gap - size), Point::new(px, py - gap)),
             // Bottom arm
-            LineSegment2f::new(Point2f::new(px, py + gap), Point2f::new(px, py + gap + size)),
+            Line::new(Point::new(px, py + gap), Point::new(px, py + gap + size)),
             // Left arm
-            LineSegment2f::new(Point2f::new(px - gap - size, py), Point2f::new(px - gap, py)),
+            Line::new(Point::new(px - gap - size, py), Point::new(px - gap, py)),
             // Right arm
-            LineSegment2f::new(Point2f::new(px + gap, py), Point2f::new(px + gap + size, py)),
+            Line::new(Point::new(px + gap, py), Point::new(px + gap + size, py)),
         ];
 
         Self {
             center,
             arms,
-            inner_thickness,
-            outline_thickness,
-            center_dot_radius: 1.0,
+            inner_stroke: Stroke::new(inner_width).with_caps(Cap::Round),
+            outline_stroke: Stroke::new(outline_width).with_caps(Cap::Round),
+            center_dot: Circle::new(center, 1.0),
         }
     }
 }
 
-/// Precomputed geometric parameters for rendering the circular brush cursor.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Precomputed `kurbo` geometric shapes and stroke styles for rendering the circular brush cursor.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CirclePrimitives {
-    pub center: Point2f,
-    pub radius: f32,
-    pub inner_thickness: f32,
-    pub outline_thickness: f32,
-    pub center_outer_dot_radius: f32,
-    pub center_inner_dot_radius: f32,
+    pub ring: Circle,
+    pub inner_stroke: Stroke,
+    pub outline_stroke: Stroke,
+    pub center_outer_dot: Circle,
+    pub center_inner_dot: Circle,
 }
 
 impl CirclePrimitives {
-    /// Computes circular ring and center dot geometry centered at `center`.
+    /// Computes `kurbo` circular ring and center dot shapes centered at `center`.
     #[inline]
-    pub fn compute(center: Point2f, config: &Config) -> Self {
-        let inner_thickness = config.circle_thickness;
+    pub fn compute(center: Point, config: &Config) -> Self {
+        let inner_width = config.circle_thickness;
+        let outline_width = inner_width + 1.6;
+
         Self {
-            center,
-            radius: config.circle_radius,
-            inner_thickness,
-            outline_thickness: inner_thickness + 1.6,
-            center_outer_dot_radius: 1.6,
-            center_inner_dot_radius: 1.0,
+            ring: Circle::new(center, config.circle_radius),
+            inner_stroke: Stroke::new(inner_width),
+            outline_stroke: Stroke::new(outline_width),
+            center_outer_dot: Circle::new(center, 1.6),
+            center_inner_dot: Circle::new(center, 1.0),
         }
     }
 }
 
-/// Precomputed geometric parameters for rendering the contracted contact dot.
+/// Precomputed `kurbo` geometric shapes for rendering the contracted contact dot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContactDotPrimitives {
-    pub center: Point2f,
-    pub inner_radius: f32,
-    pub outline_radius: f32,
+    pub outer_dot: Circle,
+    pub inner_dot: Circle,
 }
 
 impl ContactDotPrimitives {
-    /// Computes contact indicator dot radii centered at `center`.
+    /// Computes `kurbo` contact indicator dot circles centered at `center`.
     #[inline]
-    pub fn compute(center: Point2f, config: &Config) -> Self {
+    pub fn compute(center: Point, config: &Config) -> Self {
         let inner_radius = config.contact_dot_radius;
         Self {
-            center,
-            inner_radius,
-            outline_radius: inner_radius + 1.2,
+            outer_dot: Circle::new(center, inner_radius + 1.2),
+            inner_dot: Circle::new(center, inner_radius),
         }
     }
 }

@@ -4,20 +4,21 @@
 //! - Creates two `64x64` topmost click-through `SurfaceControl` sprite layers (`hover_layer`
 //!   and `contact_layer`).
 //! - Rasterizes and uploads the `Hover` and `Contact` vector sprites once at initialization
-//!   using `tiny-skia` and `ANativeWindow_lock` / `ANativeWindow_unlockAndPost`.
+//!   using Linebender `vello_cpu` and `ANativeWindow_lock` / `ANativeWindow_unlockAndPost`.
 //! - Performs zero runtime pixel writes or buffer locks: all cursor movement and
 //!   hover/contact transitions are executed exclusively via asynchronous (`oneWay`)
 //!   `SurfaceComposerClient::Transaction` (`setPosition`, `show`, `hide`).
 
 use crate::elf::find_elf64_dynsym_names;
-use crate::raster::{SPRITE_CENTER_OFFSET, SPRITE_SIZE, render_contact_sprite, render_hover_sprite};
 use crate::sys::{DlLib, set_thread_euid};
-use pencursor_core::{Config, OverlayBackend, StylusSnapshot, ViewportBounds};
+use pencursor_core::{
+    Config, OverlayBackend, Pixmap, SPRITE_CENTER_OFFSET, SPRITE_SIZE, StylusSnapshot,
+    ViewportBounds, render_contact_sprite, render_hover_sprite,
+};
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::fmt;
 use std::fs;
 use std::ptr;
-use tiny_skia::Pixmap;
 
 const PIXEL_FORMAT_RGBA_8888: i32 = 1;
 const LAYER_FLAG_SKIP_SCREENSHOT: u32 = 0x40;
@@ -708,7 +709,8 @@ impl DualSpriteOverlay {
         name: &str,
         pixmap: &Pixmap,
     ) -> Result<SpriteLayer, String> {
-        // SAFETY: Creates a `64x64` `SurfaceControl`, locks its `ANativeWindow` once to upload the pre-rendered `tiny-skia` pixmap, and configures click-through flags.
+        let sprite_size_u32 = u32::from(SPRITE_SIZE);
+        // SAFETY: Creates a `64x64` `SurfaceControl`, locks its `ANativeWindow` once to upload the pre-rendered `vello_cpu` pixmap, and configures click-through flags.
         unsafe {
             let mut name_s8 = [0u64; 4];
             let c_name = CString::new(name).unwrap();
@@ -727,8 +729,8 @@ impl DualSpriteOverlay {
                     fn_addr,
                     client_ptr,
                     name_s8.as_ptr().cast(),
-                    SPRITE_SIZE,
-                    SPRITE_SIZE,
+                    sprite_size_u32,
+                    sprite_size_u32,
                     PIXEL_FORMAT_RGBA_8888,
                     LAYER_FLAG_SKIP_SCREENSHOT,
                     (&raw mut null_binder_sp).cast(),
@@ -739,8 +741,8 @@ impl DualSpriteOverlay {
                     fn_addr,
                     client_ptr,
                     name_s8.as_ptr().cast(),
-                    SPRITE_SIZE,
-                    SPRITE_SIZE,
+                    sprite_size_u32,
+                    sprite_size_u32,
                     PIXEL_FORMAT_RGBA_8888,
                     LAYER_FLAG_SKIP_SCREENSHOT,
                     ptr::null(),
@@ -773,8 +775,8 @@ impl DualSpriteOverlay {
             (syms.anw_acquire)(native_window);
             let _ = (syms.anw_set_geometry)(
                 native_window,
-                SPRITE_SIZE as c_int,
-                SPRITE_SIZE as c_int,
+                sprite_size_u32 as c_int,
+                sprite_size_u32 as c_int,
                 PIXEL_FORMAT_RGBA_8888,
             );
 
@@ -788,12 +790,12 @@ impl DualSpriteOverlay {
                 return Err(format!("ANativeWindow_lock({name}) failed: {lock_rc}"));
             }
 
-            let src_bytes = pixmap.data();
+            let src_bytes = pixmap.data_as_u8_slice();
             let dst_base = buf.bits.cast::<u8>();
-            let row_bytes = (SPRITE_SIZE as usize) * 4;
-            let dst_stride_bytes = (buf.stride.max(SPRITE_SIZE as i32) as usize) * 4;
+            let row_bytes = usize::from(SPRITE_SIZE) * 4;
+            let dst_stride_bytes = (buf.stride.max(sprite_size_u32 as i32) as usize) * 4;
 
-            for y in 0..(SPRITE_SIZE as usize) {
+            for y in 0..usize::from(SPRITE_SIZE) {
                 let src_row = src_bytes.as_ptr().add(y * row_bytes);
                 let dst_row = dst_base.add(y * dst_stride_bytes);
                 ptr::copy_nonoverlapping(src_row, dst_row, row_bytes);

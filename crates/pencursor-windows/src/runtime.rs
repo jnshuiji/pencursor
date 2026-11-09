@@ -68,8 +68,8 @@ impl PlatformRuntime for WindowsRuntime {
         let _hook_guard = MouseHookGuard::start()?;
         println!("[Info] Stylus 全局监听服务就绪");
 
-        let mut renderer = OverlayRenderer::with_palette(config.palette)?;
-        println!("[Info] GPU DirectComposition Overlay 已启动");
+        let mut renderer = OverlayRenderer::with_config(&config)?;
+        println!("[Info] Linebender Vello + DirectComposition Overlay 已启动");
         println!("[Info] 服务正常运行中...\n");
 
         let mut msg = MSG::default();

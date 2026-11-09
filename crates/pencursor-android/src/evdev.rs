@@ -287,15 +287,15 @@ impl EvdevManager {
                                     coalesced_frame = Some(CoalescedStylusFrame::OutOfRange);
                                 } else if node.pending_activity {
                                     node.pending_activity = false;
-                                    let mapped = axis_range.map_to_viewport(
+                                    let (mapped_x, mapped_y) = axis_range.map_to_viewport(
                                         node.raw_x as f32,
                                         node.raw_y as f32,
                                         viewport,
                                     );
                                     let is_contact = node.tip_down || node.pressure > 0;
                                     coalesced_frame = Some(CoalescedStylusFrame::Active {
-                                        x: mapped.x,
-                                        y: mapped.y,
+                                        x: mapped_x,
+                                        y: mapped_y,
                                         is_contact,
                                     });
                                 }

@@ -1,9 +1,10 @@
-//! Cursor configuration, visual styling, and frame-pacing policy definitions.
+//! Cursor configuration, Linebender `peniko` color palettes, and frame-pacing policies.
 //!
-//! Defines platform-agnostic parameters for stylus overlay geometry, color palettes,
-//! inactivity timeouts, and adaptive polling intervals.
+//! Defines platform-agnostic parameters for stylus overlay geometry, color palettes
+//! backed by [`vello_cpu::peniko::Color`], inactivity timeouts, and polling intervals.
 
 use std::time::Duration;
+use vello_cpu::peniko::Color;
 
 /// Visual presentation style rendered while the stylus is hovering in range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -17,39 +18,23 @@ pub enum CursorStyle {
     Both,
 }
 
-/// Normalized floating-point RGBA color representation (`0.0..=1.0`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RgbaColor {
-    pub r: f32,
-    pub g: f32,
-    pub b: f32,
-    pub a: f32,
-}
-
-impl RgbaColor {
-    #[inline]
-    pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
-        Self { r, g, b, a }
-    }
-}
-
-/// Color palette for cursor vector primitives.
+/// Color palette for cursor vector primitives using Linebender [`Color`] (`AlphaColor<Srgb>`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CursorPalette {
     /// Primary foreground stroke and center dot color.
-    pub primary: RgbaColor,
+    pub primary: Color,
     /// High-contrast outer shadow/border color for visibility against arbitrary backgrounds.
-    pub outline: RgbaColor,
+    pub outline: Color,
     /// Highlight color used when the stylus tip is in physical contact with the surface.
-    pub contact: RgbaColor,
+    pub contact: Color,
 }
 
 impl Default for CursorPalette {
     fn default() -> Self {
         Self {
-            primary: RgbaColor::new(1.0, 1.0, 1.0, 1.0),
-            outline: RgbaColor::new(0.05, 0.05, 0.05, 0.95),
-            contact: RgbaColor::new(0.0, 0.9, 1.0, 1.0),
+            primary: Color::new([1.0, 1.0, 1.0, 1.0]),
+            outline: Color::new([0.05, 0.05, 0.05, 0.95]),
+            contact: Color::new([0.0, 0.9, 1.0, 1.0]),
         }
     }
 }
@@ -61,19 +46,19 @@ pub struct Config {
     pub style: CursorStyle,
 
     /// Length of each crosshair arm in pixels.
-    pub crosshair_size: f32,
+    pub crosshair_size: f64,
     /// Radius of the transparent center gap of the crosshair in pixels.
-    pub crosshair_gap: f32,
+    pub crosshair_gap: f64,
     /// Stroke thickness of the primary crosshair lines in pixels.
-    pub crosshair_thickness: f32,
+    pub crosshair_thickness: f64,
 
     /// Radius of the circular cursor ring in pixels.
-    pub circle_radius: f32,
+    pub circle_radius: f64,
     /// Stroke thickness of the circular cursor ring in pixels.
-    pub circle_thickness: f32,
+    pub circle_thickness: f64,
 
     /// Radius of the contracted indicator dot during tip contact in pixels.
-    pub contact_dot_radius: f32,
+    pub contact_dot_radius: f64,
 
     /// Inactivity threshold in milliseconds before the stylus is considered out of range.
     pub hover_timeout_ms: u64,

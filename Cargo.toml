@@ -11,7 +11,7 @@ default-members = ["crates/pencursor"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jnshuiji/pencursor"
 
@@ -19,7 +19,7 @@ repository = "https://github.com/jnshuiji/pencursor"
 pencursor-core = { path = "crates/pencursor-core" }
 pencursor-windows = { path = "crates/pencursor-windows" }
 pencursor-android = { path = "crates/pencursor-android" }
-tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+vello_cpu = { version = "0.3.0", default-features = false, features = ["std", "u8_pipeline"] }
 windows-numerics = "0.3"
 
 [workspace.dependencies.windows]
@@ -31,8 +31,6 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Graphics_Gdi",
-    "Win32_Graphics_Direct2D",
-    "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_DirectComposition",

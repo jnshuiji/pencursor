@@ -1,11 +1,14 @@
 [package]
 name = "pencursor-core"
-description = "Platform-agnostic domain models, lock-free stylus state machine, coordinate mapping, and backend traits for PenCursor"
+description = "Platform-agnostic domain models, lock-free stylus state machine, Linebender kurbo/peniko geometry, and vello_cpu cursor rasterizer for PenCursor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+vello_cpu.workspace = true
 
 [lints]
 workspace = true

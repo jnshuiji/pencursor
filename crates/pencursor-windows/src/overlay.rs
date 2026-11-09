@@ -1,18 +1,19 @@
-//! Fullscreen transparent hardware-accelerated overlay and vector cursor renderer.
+//! Hardware-accelerated DirectComposition sprite overlay renderer for Windows.
 //!
-//! Combines a click-through topmost Win32 layered popup window with Direct3D 11, DXGI
-//! (configured for 1-frame maximum latency), DirectComposition, and Direct2D for zero-copy
-//! vector cursor composition.
+//! Architecture:
+//! - Rasterizes `64x64` premultiplied RGBA8 `Hover` and `Contact` sprites once at startup
+//!   using Linebender `vello_cpu` in `pencursor-core`.
+//! - Uploads each sprite once into a dedicated `64x64` `DXGI_FORMAT_R8G8B8A8_UNORM` composition
+//!   swap chain (`hover_swapchain` and `contact_swapchain`).
+//! - Performs zero runtime pixel redraws: cursor motion and hover/contact transitions are
+//!   driven purely by `IDCompositionVisual::SetOffsetX2`, `SetOffsetY2`, and `SetContent`.
 
 use crate::input::{current_virtual_screen_bounds, process_wm_input};
 use pencursor_core::{
-    CirclePrimitives, Config, ContactDotPrimitives, CrosshairPrimitives, CursorPalette,
-    CursorStyle, OverlayBackend, Point2f, RgbaColor, StylusSnapshot, ViewportBounds,
+    Config, OverlayBackend, Pixmap, SPRITE_CENTER_OFFSET, SPRITE_SIZE, StylusSnapshot,
+    ViewportBounds, render_contact_sprite, render_hover_sprite,
 };
-use std::mem::ManuallyDrop;
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Direct2D::Common::*;
-use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::DirectComposition::*;
@@ -23,22 +24,6 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
-use windows_numerics::Vector2;
-
-#[inline]
-const fn to_d2d_color(color: RgbaColor) -> D2D1_COLOR_F {
-    D2D1_COLOR_F {
-        r: color.r,
-        g: color.g,
-        b: color.b,
-        a: color.a,
-    }
-}
-
-#[inline]
-const fn to_vec2(pt: Point2f) -> Vector2 {
-    Vector2 { X: pt.x, Y: pt.y }
-}
 
 /// Window procedure for the transparent overlay `HWND`.
 unsafe extern "system" fn overlay_wnd_proc(
@@ -64,32 +49,44 @@ unsafe extern "system" fn overlay_wnd_proc(
     }
 }
 
-/// GPU-accelerated DirectComposition + Direct2D overlay renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveSprite {
+    None,
+    Hover,
+    Contact,
+}
+
+/// GPU-accelerated DirectComposition `64x64` dual-sprite overlay renderer.
 #[derive(Debug)]
 pub struct OverlayRenderer {
     viewport: ViewportBounds,
-    swapchain: IDXGISwapChain1,
+    dcomp_device: IDCompositionDevice,
     _dcomp_target: IDCompositionTarget,
-    d2d_context: ID2D1DeviceContext,
-    primary_brush: ID2D1SolidColorBrush,
-    outline_brush: ID2D1SolidColorBrush,
-    contact_brush: ID2D1SolidColorBrush,
-    was_visible: bool,
+    cursor_visual: IDCompositionVisual,
+    hover_swapchain: IDXGISwapChain1,
+    contact_swapchain: IDXGISwapChain1,
+    active_sprite: ActiveSprite,
+    last_x: f32,
+    last_y: f32,
 }
 
 impl OverlayRenderer {
-    /// Initializes the overlay window and DirectX rendering pipeline using [`CursorPalette::default`].
+    /// Initializes the overlay window and DirectComposition pipeline using [`Config::default`].
     pub fn new() -> Result<Self> {
-        Self::with_palette(CursorPalette::default())
+        Self::with_config(&Config::default())
     }
 
-    /// Initializes the overlay window and DirectX rendering pipeline with the specified [`CursorPalette`].
-    pub fn with_palette(palette: CursorPalette) -> Result<Self> {
+    /// Initializes the overlay window, pre-renders `64x64` sprites via Linebender `vello_cpu`,
+    /// and uploads them into two `DirectComposition` swap chains.
+    pub fn with_config(config: &Config) -> Result<Self> {
         let viewport = current_virtual_screen_bounds();
         let vx = viewport.origin_x as i32;
         let vy = viewport.origin_y as i32;
         let width = viewport.width.max(1.0) as u32;
         let height = viewport.height.max(1.0) as u32;
+
+        let hover_pixmap = render_hover_sprite(config);
+        let contact_pixmap = render_contact_sprite(config);
 
         // SAFETY: Registers the window class and creates a topmost, click-through popup `HWND`.
         let hwnd = unsafe {
@@ -126,9 +123,6 @@ impl OverlayRenderer {
             )?
         };
 
-        // Register global RawInput sinks on the overlay window:
-        // 1. Digitizers (UsagePage 0x0D, RIDEV_PAGEONLY) for system-wide stylus reports.
-        // 2. Mouse (UsagePage 0x01, Usage 0x02) for absolute tablet mouse mode and physical mouse preemption.
         let rids = [
             RAWINPUTDEVICE {
                 usUsagePage: 0x0D,
@@ -148,7 +142,6 @@ impl OverlayRenderer {
             let _ = RegisterRawInputDevices(&rids, size_of::<RAWINPUTDEVICE>() as u32);
         }
 
-        // Create hardware Direct3D 11 device with BGRA support for Direct2D interop.
         let mut d3d_device: Option<ID3D11Device> = None;
         let mut d3d_context: Option<ID3D11DeviceContext> = None;
         let feature_levels = [
@@ -157,7 +150,7 @@ impl OverlayRenderer {
             D3D_FEATURE_LEVEL_10_1,
         ];
 
-        // SAFETY: Standard `D3D11CreateDevice` initialization with hardware driver and BGRA support.
+        // SAFETY: Standard `D3D11CreateDevice` initialization with hardware driver.
         unsafe {
             D3D11CreateDevice(
                 None,
@@ -174,261 +167,151 @@ impl OverlayRenderer {
 
         let d3d_device =
             d3d_device.ok_or_else(|| Error::new(E_FAIL, "D3D11CreateDevice returned None"))?;
+        let d3d_context =
+            d3d_context.ok_or_else(|| Error::new(E_FAIL, "D3D11ImmediateContext is None"))?;
         let dxgi_device: IDXGIDevice = d3d_device.cast()?;
         let dxgi_device1: IDXGIDevice1 = d3d_device.cast()?;
 
-        // SAFETY: Configures 1-frame DXGI latency, composition swap chain, DirectComposition visual tree, and Direct2D brushes.
-        let (swapchain, dcomp_target, d2d_context, primary_brush, outline_brush, contact_brush) = unsafe {
+        // SAFETY: Configures 1-frame DXGI latency, creates two 64x64 RGBA8 swap chains, uploads `vello_cpu` sprites, and initializes DirectComposition visual tree.
+        let (dcomp_device, dcomp_target, cursor_visual, hover_swapchain, contact_swapchain) = unsafe {
             let _ = dxgi_device1.SetMaximumFrameLatency(1);
 
             let dxgi_adapter = dxgi_device.GetAdapter()?;
             let dxgi_factory: IDXGIFactory2 = dxgi_adapter.GetParent()?;
 
-            let swapchain_desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: width,
-                Height: height,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                Stereo: BOOL(0),
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: 2,
-                Scaling: DXGI_SCALING_STRETCH,
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-                Flags: 0,
-            };
-
-            let swapchain =
-                dxgi_factory.CreateSwapChainForComposition(&dxgi_device, &swapchain_desc, None)?;
+            let hover_swapchain =
+                Self::create_and_upload_sprite_swapchain(&dxgi_factory, &dxgi_device, &d3d_context, &hover_pixmap)?;
+            let contact_swapchain =
+                Self::create_and_upload_sprite_swapchain(&dxgi_factory, &dxgi_device, &d3d_context, &contact_pixmap)?;
 
             let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(Some(&dxgi_device))?;
             let dcomp_target = dcomp_device.CreateTargetForHwnd(hwnd, true)?;
-            let visual = dcomp_device.CreateVisual()?;
-            visual.SetContent(&swapchain)?;
-            dcomp_target.SetRoot(&visual)?;
+            let cursor_visual = dcomp_device.CreateVisual()?;
+            cursor_visual.SetContent(None)?;
+            dcomp_target.SetRoot(&cursor_visual)?;
             dcomp_device.Commit()?;
-
-            let d2d_factory: ID2D1Factory1 =
-                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let d2d_device = d2d_factory.CreateDevice(&dxgi_device)?;
-            let d2d_context = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
-
-            let primary_brush = d2d_context
-                .CreateSolidColorBrush(&to_d2d_color(palette.primary), None)?;
-            let outline_brush = d2d_context
-                .CreateSolidColorBrush(&to_d2d_color(palette.outline), None)?;
-            let contact_brush = d2d_context
-                .CreateSolidColorBrush(&to_d2d_color(palette.contact), None)?;
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = UpdateWindow(hwnd);
 
             (
-                swapchain,
+                dcomp_device,
                 dcomp_target,
-                d2d_context,
-                primary_brush,
-                outline_brush,
-                contact_brush,
+                cursor_visual,
+                hover_swapchain,
+                contact_swapchain,
             )
         };
 
         Ok(Self {
             viewport,
-            swapchain,
+            dcomp_device,
             _dcomp_target: dcomp_target,
-            d2d_context,
-            primary_brush,
-            outline_brush,
-            contact_brush,
-            was_visible: false,
+            cursor_visual,
+            hover_swapchain,
+            contact_swapchain,
+            active_sprite: ActiveSprite::None,
+            last_x: f32::NAN,
+            last_y: f32::NAN,
         })
     }
 
-    /// Renders a single cursor overlay frame according to `snapshot` and `config`.
-    pub fn render_frame(&mut self, snapshot: &StylusSnapshot, config: &Config) -> Result<()> {
-        if !snapshot.in_range {
-            if self.was_visible {
-                self.present_d2d_frame(|_| {})?;
-                self.was_visible = false;
-            }
+    unsafe fn create_and_upload_sprite_swapchain(
+        dxgi_factory: &IDXGIFactory2,
+        dxgi_device: &IDXGIDevice,
+        d3d_context: &ID3D11DeviceContext,
+        pixmap: &Pixmap,
+    ) -> Result<IDXGISwapChain1> {
+        let sprite_size = u32::from(SPRITE_SIZE);
+        let desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: sprite_size,
+            Height: sprite_size,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Stereo: BOOL(0),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+            Flags: 0,
+        };
+
+        // SAFETY: Creates a 64x64 composition swap chain, copies the `vello_cpu` RGBA8 buffer into texture 0, and presents it once.
+        unsafe {
+            let swapchain =
+                dxgi_factory.CreateSwapChainForComposition(dxgi_device, &desc, None)?;
+            let backbuffer: ID3D11Texture2D = swapchain.GetBuffer(0)?;
+            let row_pitch = sprite_size * 4;
+            d3d_context.UpdateSubresource(
+                &backbuffer,
+                0,
+                None,
+                pixmap.data_as_u8_slice().as_ptr().cast(),
+                row_pitch,
+                0,
+            );
+            swapchain.Present(0, DXGI_PRESENT(0)).ok()?;
+            Ok(swapchain)
+        }
+    }
+
+    /// Updates the DirectComposition visual position and active sprite content for the current frame.
+    pub fn render_frame(&mut self, snapshot: &StylusSnapshot, _config: &Config) -> Result<()> {
+        let desired = if !snapshot.in_range {
+            ActiveSprite::None
+        } else if snapshot.is_contact {
+            ActiveSprite::Contact
+        } else {
+            ActiveSprite::Hover
+        };
+
+        if desired == ActiveSprite::None && self.active_sprite == ActiveSprite::None {
             return Ok(());
         }
 
-        self.was_visible = true;
-        let center = self.viewport.to_local(snapshot.x, snapshot.y);
+        let local = self.viewport.to_local(snapshot.x, snapshot.y);
+        let top_left_x = (local.x as f32) - SPRITE_CENTER_OFFSET;
+        let top_left_y = (local.y as f32) - SPRITE_CENTER_OFFSET;
 
-        self.present_d2d_frame(|renderer| {
-            if snapshot.is_contact {
-                let dot = ContactDotPrimitives::compute(center, config);
-                renderer.draw_contact_dot(&dot);
-            } else {
-                match config.style {
-                    CursorStyle::Crosshair => {
-                        let cross = CrosshairPrimitives::compute(center, config);
-                        renderer.draw_crosshair(&cross);
+        if desired == self.active_sprite
+            && (top_left_x - self.last_x).abs() < 0.05
+            && (top_left_y - self.last_y).abs() < 0.05
+        {
+            return Ok(());
+        }
+
+        // SAFETY: Updates the DirectComposition visual offset and swapchain content, then commits the batch to DWM.
+        unsafe {
+            match desired {
+                ActiveSprite::None => {
+                    self.cursor_visual.SetContent(None)?;
+                }
+                ActiveSprite::Hover => {
+                    if self.active_sprite != ActiveSprite::Hover {
+                        self.cursor_visual.SetContent(&self.hover_swapchain)?;
                     }
-                    CursorStyle::Circle => {
-                        let circle = CirclePrimitives::compute(center, config);
-                        renderer.draw_circle(&circle);
+                    self.cursor_visual.SetOffsetX2(top_left_x)?;
+                    self.cursor_visual.SetOffsetY2(top_left_y)?;
+                }
+                ActiveSprite::Contact => {
+                    if self.active_sprite != ActiveSprite::Contact {
+                        self.cursor_visual.SetContent(&self.contact_swapchain)?;
                     }
-                    CursorStyle::Both => {
-                        let circle = CirclePrimitives::compute(center, config);
-                        let cross = CrosshairPrimitives::compute(center, config);
-                        renderer.draw_circle(&circle);
-                        renderer.draw_crosshair(&cross);
-                    }
+                    self.cursor_visual.SetOffsetX2(top_left_x)?;
+                    self.cursor_visual.SetOffsetY2(top_left_y)?;
                 }
             }
-        })
-    }
-
-    /// Acquires the swap chain backbuffer, clears it to transparent, executes `draw_commands`, and presents.
-    fn present_d2d_frame(&self, draw_commands: impl FnOnce(&Self)) -> Result<()> {
-        // SAFETY: Binds swap chain buffer 0 as a Direct2D target bitmap, executes draw calls, unbinds before releasing, and presents with sync interval 0.
-        unsafe {
-            let surface: IDXGISurface = self.swapchain.GetBuffer(0)?;
-            let bitmap_props = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                colorContext: ManuallyDrop::new(None),
-            };
-
-            let target_bitmap = self
-                .d2d_context
-                .CreateBitmapFromDxgiSurface(&surface, Some(&bitmap_props))?;
-
-            self.d2d_context.SetTarget(&target_bitmap);
-            self.d2d_context.BeginDraw();
-            self.d2d_context.Clear(Some(&D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            }));
-
-            draw_commands(self);
-
-            let _ = self.d2d_context.EndDraw(None, None);
-            self.d2d_context.SetTarget(None);
-            drop(target_bitmap);
-            drop(surface);
-
-            self.swapchain.Present(0, DXGI_PRESENT(0)).ok()?;
+            self.dcomp_device.Commit()?;
         }
 
+        self.active_sprite = desired;
+        self.last_x = top_left_x;
+        self.last_y = top_left_y;
         Ok(())
-    }
-
-    /// Draws the contracted contact indicator dot.
-    fn draw_contact_dot(&self, dot: &ContactDotPrimitives) {
-        let pt = to_vec2(dot.center);
-        // SAFETY: Invoked within an active `BeginDraw` / `EndDraw` scope on `self.d2d_context`.
-        unsafe {
-            self.d2d_context.FillEllipse(
-                &D2D1_ELLIPSE {
-                    point: pt,
-                    radiusX: dot.outline_radius,
-                    radiusY: dot.outline_radius,
-                },
-                &self.outline_brush,
-            );
-
-            self.d2d_context.FillEllipse(
-                &D2D1_ELLIPSE {
-                    point: pt,
-                    radiusX: dot.inner_radius,
-                    radiusY: dot.inner_radius,
-                },
-                &self.contact_brush,
-            );
-        }
-    }
-
-    /// Draws the high-contrast crosshair cursor.
-    fn draw_crosshair(&self, cross: &CrosshairPrimitives) {
-        // SAFETY: Invoked within an active `BeginDraw` / `EndDraw` scope on `self.d2d_context`.
-        unsafe {
-            for seg in &cross.arms {
-                self.d2d_context.DrawLine(
-                    to_vec2(seg.start),
-                    to_vec2(seg.end),
-                    &self.outline_brush,
-                    cross.outline_thickness,
-                    None,
-                );
-            }
-
-            for seg in &cross.arms {
-                self.d2d_context.DrawLine(
-                    to_vec2(seg.start),
-                    to_vec2(seg.end),
-                    &self.primary_brush,
-                    cross.inner_thickness,
-                    None,
-                );
-            }
-
-            self.d2d_context.FillEllipse(
-                &D2D1_ELLIPSE {
-                    point: to_vec2(cross.center),
-                    radiusX: cross.center_dot_radius,
-                    radiusY: cross.center_dot_radius,
-                },
-                &self.primary_brush,
-            );
-        }
-    }
-
-    /// Draws the high-contrast circular brush ring and center dot.
-    fn draw_circle(&self, circle: &CirclePrimitives) {
-        let pt = to_vec2(circle.center);
-        let ellipse = D2D1_ELLIPSE {
-            point: pt,
-            radiusX: circle.radius,
-            radiusY: circle.radius,
-        };
-
-        // SAFETY: Invoked within an active `BeginDraw` / `EndDraw` scope on `self.d2d_context`.
-        unsafe {
-            self.d2d_context.DrawEllipse(
-                &ellipse,
-                &self.outline_brush,
-                circle.outline_thickness,
-                None,
-            );
-            self.d2d_context.DrawEllipse(
-                &ellipse,
-                &self.primary_brush,
-                circle.inner_thickness,
-                None,
-            );
-
-            self.d2d_context.FillEllipse(
-                &D2D1_ELLIPSE {
-                    point: pt,
-                    radiusX: circle.center_outer_dot_radius,
-                    radiusY: circle.center_outer_dot_radius,
-                },
-                &self.outline_brush,
-            );
-            self.d2d_context.FillEllipse(
-                &D2D1_ELLIPSE {
-                    point: pt,
-                    radiusX: circle.center_inner_dot_radius,
-                    radiusY: circle.center_inner_dot_radius,
-                },
-                &self.primary_brush,
-            );
-        }
     }
 }
 

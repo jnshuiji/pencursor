@@ -84,12 +84,11 @@ pub fn process_wm_input(lparam: LPARAM) {
         if is_pen || is_absolute {
             let (px, py) = if is_absolute {
                 let viewport = current_virtual_screen_bounds();
-                let pt = DeviceAxisRange::WIN32_ABSOLUTE_MOUSE.map_to_viewport(
+                DeviceAxisRange::WIN32_ABSOLUTE_MOUSE.map_to_viewport(
                     mouse.lLastX as f32,
                     mouse.lLastY as f32,
                     viewport,
-                );
-                (pt.x, pt.y)
+                )
             } else {
                 let mut pt = POINT::default();
                 // SAFETY: Passes a valid stack pointer to `POINT`.

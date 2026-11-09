@@ -1,6 +1,6 @@
 [package]
 name = "pencursor-windows"
-description = "Windows platform backend for PenCursor (Win32 RawInput HID Digitizer, WH_MOUSE_LL Hook, DirectComposition + Direct2D Overlay)"
+description = "Windows platform backend for PenCursor (Win32 RawInput HID Digitizer, WH_MOUSE_LL Hook, DirectComposition 64x64 Sprite Overlay)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

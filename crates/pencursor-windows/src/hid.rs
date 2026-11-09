@@ -199,15 +199,15 @@ pub fn parse_digitizer_report(hdevice: HANDLE, report: &[u8]) -> Option<Digitize
             }
 
             let viewport = current_virtual_screen_bounds();
-            let mapped = DeviceAxisRange::from_max(max_x, max_y).map_to_viewport(
+            let (mapped_x, mapped_y) = DeviceAxisRange::from_max(max_x, max_y).map_to_viewport(
                 raw_x as f32,
                 raw_y as f32,
                 viewport,
             );
 
             return Some(DigitizerReport {
-                x: mapped.x,
-                y: mapped.y,
+                x: mapped_x,
+                y: mapped_y,
                 is_contact,
             });
         }
