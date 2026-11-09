@@ -1,0 +1,21 @@
+[package]
+name = "pencursor"
+description = "Low-latency hardware-accelerated stylus cursor overlay service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pencursor"
+path = "src/main.rs"
+
+[dependencies]
+pencursor-core.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+pencursor-windows.workspace = true
+
+[lints]
+workspace = true

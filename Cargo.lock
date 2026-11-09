@@ -6,6 +6,19 @@ version = 4
 name = "pencursor"
 version = "0.1.0"
 dependencies = [
+ "pencursor-core",
+ "pencursor-windows",
+]
+
+[[package]]
+name = "pencursor-core"
+version = "0.1.0"
+
+[[package]]
+name = "pencursor-windows"
+version = "0.1.0"
+dependencies = [
+ "pencursor-core",
  "windows",
  "windows-numerics",
 ]

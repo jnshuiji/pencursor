@@ -1,12 +1,25 @@
-[package]
-name = "pencursor"
+[workspace]
+resolver = "3"
+members = [
+    "crates/pencursor-core",
+    "crates/pencursor-windows",
+    "crates/pencursor",
+]
+default-members = ["crates/pencursor"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jnshuiji/pencursor"
 
-[dependencies]
+[workspace.dependencies]
+pencursor-core = { path = "crates/pencursor-core" }
+pencursor-windows = { path = "crates/pencursor-windows" }
 windows-numerics = "0.3"
 
-[dependencies.windows]
+[workspace.dependencies.windows]
 version = "0.62"
 features = [
     "Win32_Foundation",
@@ -23,5 +36,25 @@ features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
     "Win32_UI_HiDpi",
 ]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+opt-level = 3

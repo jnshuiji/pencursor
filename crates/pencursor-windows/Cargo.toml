@@ -1,0 +1,18 @@
+[package]
+name = "pencursor-windows"
+description = "Windows platform backend for PenCursor (Win32 RawInput HID Digitizer, WH_MOUSE_LL Hook, DirectComposition + Direct2D Overlay)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pencursor-core.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+windows-numerics.workspace = true
+
+[lints]
+workspace = true
