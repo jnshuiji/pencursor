@@ -8,96 +8,21 @@
 //! - Drains all queued `input_event` packets until `EAGAIN` on each `epoll` wakeup, coalescing
 //!   intermediate `SYN_REPORT` frames so `SurfaceFlinger` receives at most one `Transaction` per wakeup.
 
-use crate::power::{GAOMON_USB_PID, GAOMON_USB_VID, apply_usb_power_policy};
+mod device;
+
+use crate::power::apply_usb_power_policy_with_config;
 use crate::sys::{
     EPOLLERR, EPOLLHUP, EPOLLIN, O_CLOEXEC, O_NONBLOCK, O_RDONLY, OwnedFd, epoll_add, epoll_del,
-    ioctl, open, read,
+    open, read,
 };
-use pencursor_core::{DeviceAxisRange, StylusStateTracker, ViewportBounds};
+use device::{
+    ABS_PRESSURE, ABS_X, ABS_Y, BTN_TOOL_PEN, BTN_TOOL_RUBBER, BTN_TOUCH, DeviceKind, EV_ABS,
+    EV_KEY, EV_REL, EV_SYN, LinuxInputEvent, REL_X, REL_Y, SYN_REPORT, classify_evdev_node,
+};
+use pencursor_core::{StylusStateTracker, UsbPowerConfig, ViewportBounds};
 use std::collections::HashMap;
-use std::ffi::{CString, c_int, c_ulong, c_void};
+use std::ffi::{CString, c_int, c_void};
 use std::fs;
-
-const GAOMON_VID_NUM: u16 = 0x256c;
-const GAOMON_PID_NUM: u16 = 0x0064;
-
-const EV_SYN: u16 = 0x00;
-const EV_KEY: u16 = 0x01;
-const EV_REL: u16 = 0x02;
-const EV_ABS: u16 = 0x03;
-
-const SYN_REPORT: u16 = 0x00;
-
-const REL_X: u16 = 0x00;
-const REL_Y: u16 = 0x01;
-
-const ABS_X: u16 = 0x00;
-const ABS_Y: u16 = 0x01;
-const ABS_PRESSURE: u16 = 0x18;
-
-const BTN_LEFT: u16 = 0x110;
-const BTN_TOOL_PEN: u16 = 0x140;
-const BTN_TOOL_RUBBER: u16 = 0x141;
-const BTN_TOUCH: u16 = 0x14a;
-const BTN_STYLUS: u16 = 0x14b;
-
-/// `_IOR('E', 0x02, struct input_id)` (`sizeof(input_id) == 8`).
-const EVIOCGID: c_ulong = (2u64 << 30) | (8u64 << 16) | ((b'E' as u64) << 8) | 0x02;
-
-/// `_IOR('E', 0x20 + ev, len)`.
-#[inline(always)]
-const fn eviocgbit(ev: u32, len: usize) -> c_ulong {
-    (2u64 << 30) | ((len as u64) << 16) | ((b'E' as u64) << 8) | ((0x20 + ev) as u64)
-}
-
-/// `_IOR('E', 0x40 + abs, struct input_absinfo)` (`sizeof(input_absinfo) == 24`).
-#[inline(always)]
-const fn eviocgabs(abs: u32) -> c_ulong {
-    (2u64 << 30) | (24u64 << 16) | ((b'E' as u64) << 8) | ((0x40 + abs) as u64)
-}
-
-#[inline]
-fn test_bit(bit: u16, bytes: &[u8]) -> bool {
-    let idx = (bit as usize) / 8;
-    let shift = (bit as usize) % 8;
-    idx < bytes.len() && (bytes[idx] & (1u8 << shift)) != 0
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct LinuxInputEvent {
-    tv_sec: i64,
-    tv_usec: i64,
-    ty: u16,
-    code: u16,
-    value: i32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct InputId {
-    bustype: u16,
-    vendor: u16,
-    product: u16,
-    version: u16,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct InputAbsInfo {
-    value: i32,
-    minimum: i32,
-    maximum: i32,
-    fuzz: i32,
-    flat: i32,
-    resolution: i32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum DeviceKind {
-    StylusDigitizer { axis_range: DeviceAxisRange },
-    RelativeMouse,
-}
 
 #[derive(Debug)]
 struct EvdevNode {
@@ -111,6 +36,12 @@ struct EvdevNode {
     in_proximity: bool,
     pending_activity: bool,
     pending_out_of_range: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CoalescedStylusFrame {
+    Active { x: f32, y: f32, is_contact: bool },
+    OutOfRange,
 }
 
 /// Manages active `/dev/input/event*` file descriptors registered with the daemon's `epoll` loop.
@@ -128,10 +59,19 @@ impl EvdevManager {
         }
     }
 
-    /// Scans `/dev/input`, enforces USB power policy on matching tablets, and registers any new
+    /// Scans `/dev/input`, enforces default USB power policy on matching tablets, and registers any new
     /// stylus digitizer or mouse nodes with `epoll_fd`.
     pub fn scan_and_register(&mut self, epoll_fd: c_int) {
-        apply_usb_power_policy(GAOMON_USB_VID, GAOMON_USB_PID);
+        self.scan_and_register_with_config(epoll_fd, &UsbPowerConfig::default());
+    }
+
+    /// Scans `/dev/input`, enforces [`UsbPowerConfig`] on matching tablets, and registers any new
+    /// stylus digitizer or mouse nodes with `epoll_fd`.
+    pub fn scan_and_register_with_config(&mut self, epoll_fd: c_int, usb_power: &UsbPowerConfig) {
+        apply_usb_power_policy_with_config(usb_power);
+
+        let target_vid = usb_power.vid_u16();
+        let target_pid = usb_power.pid_u16();
 
         let Ok(dir) = fs::read_dir("/dev/input") else {
             return;
@@ -161,7 +101,7 @@ impl EvdevManager {
             // SAFETY: `raw_fd` is a valid newly opened file descriptor.
             let fd = unsafe { OwnedFd::from_raw(raw_fd) };
 
-            let Some(kind) = classify_evdev_node(fd.raw()) else {
+            let Some(kind) = classify_evdev_node(fd.raw(), target_vid, target_pid) else {
                 continue;
             };
 
@@ -245,66 +185,66 @@ impl EvdevManager {
             let count = (n_bytes as usize) / elem_sz;
             for ev in &ev_buf[..count] {
                 match node.kind {
-                    DeviceKind::StylusDigitizer { axis_range } => {
-                        match ev.ty {
-                            EV_ABS => match ev.code {
-                                ABS_X => {
-                                    node.raw_x = ev.value;
+                    DeviceKind::StylusDigitizer { axis_range } => match ev.ty {
+                        EV_ABS => match ev.code {
+                            ABS_X => {
+                                node.raw_x = ev.value;
+                                node.pending_activity = true;
+                            }
+                            ABS_Y => {
+                                node.raw_y = ev.value;
+                                node.pending_activity = true;
+                            }
+                            ABS_PRESSURE => {
+                                node.pressure = ev.value;
+                                node.pending_activity = true;
+                            }
+                            _ => {}
+                        },
+                        EV_KEY => match ev.code {
+                            BTN_TOUCH => {
+                                node.tip_down = ev.value != 0;
+                                node.pending_activity = true;
+                            }
+                            BTN_TOOL_PEN | BTN_TOOL_RUBBER => {
+                                node.in_proximity = ev.value != 0;
+                                if node.in_proximity {
                                     node.pending_activity = true;
-                                }
-                                ABS_Y => {
-                                    node.raw_y = ev.value;
-                                    node.pending_activity = true;
-                                }
-                                ABS_PRESSURE => {
-                                    node.pressure = ev.value;
-                                    node.pending_activity = true;
-                                }
-                                _ => {}
-                            },
-                            EV_KEY => match ev.code {
-                                BTN_TOUCH => {
-                                    node.tip_down = ev.value != 0;
-                                    node.pending_activity = true;
-                                }
-                                BTN_TOOL_PEN | BTN_TOOL_RUBBER => {
-                                    node.in_proximity = ev.value != 0;
-                                    if node.in_proximity {
-                                        node.pending_activity = true;
-                                        node.pending_out_of_range = false;
-                                    } else {
-                                        node.pending_out_of_range = true;
-                                        node.pending_activity = false;
-                                        node.tip_down = false;
-                                        node.pressure = 0;
-                                    }
-                                }
-                                _ => {}
-                            },
-                            EV_SYN if ev.code == SYN_REPORT => {
-                                if node.pending_out_of_range {
                                     node.pending_out_of_range = false;
-                                    coalesced_frame = Some(CoalescedStylusFrame::OutOfRange);
-                                } else if node.pending_activity {
+                                } else {
+                                    node.pending_out_of_range = true;
                                     node.pending_activity = false;
-                                    let (mapped_x, mapped_y) = axis_range.map_to_viewport(
-                                        node.raw_x as f32,
-                                        node.raw_y as f32,
-                                        viewport,
-                                    );
-                                    let is_contact = node.tip_down || node.pressure > 0;
-                                    coalesced_frame = Some(CoalescedStylusFrame::Active {
-                                        x: mapped_x,
-                                        y: mapped_y,
-                                        is_contact,
-                                    });
+                                    node.tip_down = false;
+                                    node.pressure = 0;
                                 }
                             }
                             _ => {}
+                        },
+                        EV_SYN if ev.code == SYN_REPORT => {
+                            if node.pending_out_of_range {
+                                node.pending_out_of_range = false;
+                                coalesced_frame = Some(CoalescedStylusFrame::OutOfRange);
+                            } else if node.pending_activity {
+                                node.pending_activity = false;
+                                let (mapped_x, mapped_y) = axis_range.map_to_viewport(
+                                    node.raw_x as f32,
+                                    node.raw_y as f32,
+                                    viewport,
+                                );
+                                let is_contact = node.tip_down || node.pressure > 0;
+                                coalesced_frame = Some(CoalescedStylusFrame::Active {
+                                    x: mapped_x,
+                                    y: mapped_y,
+                                    is_contact,
+                                });
+                            }
                         }
-                    }
+                        _ => {}
+                    },
                     DeviceKind::RelativeMouse => {
-                        if ev.ty == EV_REL && (ev.code == REL_X || ev.code == REL_Y) && ev.value != 0
+                        if ev.ty == EV_REL
+                            && (ev.code == REL_X || ev.code == REL_Y)
+                            && ev.value != 0
                         {
                             tracker.mark_mouse_active();
                             state_changed = true;
@@ -314,7 +254,6 @@ impl EvdevManager {
             }
         }
 
-        // Apply only the final coalesced SYN_REPORT state from this epoll wakeup batch.
         if let Some(frame) = coalesced_frame {
             match frame {
                 CoalescedStylusFrame::Active { x, y, is_contact } => {
@@ -335,73 +274,4 @@ impl EvdevManager {
 
         state_changed
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CoalescedStylusFrame {
-    Active { x: f32, y: f32, is_contact: bool },
-    OutOfRange,
-}
-
-/// Inspects an open `evdev` file descriptor via `ioctl` to determine whether it is a stylus
-/// digitizer or a physical relative mouse.
-fn classify_evdev_node(fd: c_int) -> Option<DeviceKind> {
-    let mut id = InputId::default();
-    // SAFETY: Queries `EVIOCGID` into stack-allocated `InputId`.
-    let has_id = unsafe { ioctl(fd, EVIOCGID, &raw mut id) == 0 };
-
-    let mut key_bits = [0u8; 96];
-    // SAFETY: Queries `EV_KEY` capability bitmask into `key_bits`.
-    let _ = unsafe {
-        ioctl(
-            fd,
-            eviocgbit(EV_KEY as u32, key_bits.len()),
-            key_bits.as_mut_ptr(),
-        )
-    };
-
-    let mut abs_x = InputAbsInfo::default();
-    let mut abs_y = InputAbsInfo::default();
-    // SAFETY: Queries `ABS_X` and `ABS_Y` axis descriptors into `InputAbsInfo`.
-    let has_abs_x = unsafe { ioctl(fd, eviocgabs(ABS_X as u32), &raw mut abs_x) == 0 };
-    // SAFETY: Queries `ABS_Y` axis descriptor into `InputAbsInfo`.
-    let has_abs_y = unsafe { ioctl(fd, eviocgabs(ABS_Y as u32), &raw mut abs_y) == 0 };
-
-    let valid_abs_xy =
-        has_abs_x && has_abs_y && abs_x.maximum > abs_x.minimum && abs_y.maximum > abs_y.minimum;
-
-    let is_gaomon = has_id && id.vendor == GAOMON_VID_NUM && id.product == GAOMON_PID_NUM;
-    let has_pen_tool = test_bit(BTN_TOOL_PEN, &key_bits) || test_bit(BTN_STYLUS, &key_bits);
-
-    if valid_abs_xy && (is_gaomon || has_pen_tool) {
-        return Some(DeviceKind::StylusDigitizer {
-            axis_range: DeviceAxisRange::new(
-                abs_x.minimum as f32,
-                abs_x.maximum as f32,
-                abs_y.minimum as f32,
-                abs_y.maximum as f32,
-            ),
-        });
-    }
-
-    let mut rel_bits = [0u8; 8];
-    // SAFETY: Queries `EV_REL` capability bitmask into `rel_bits`.
-    let has_rel = unsafe {
-        ioctl(
-            fd,
-            eviocgbit(EV_REL as u32, rel_bits.len()),
-            rel_bits.as_mut_ptr(),
-        ) >= 0
-    };
-
-    if has_rel
-        && !valid_abs_xy
-        && test_bit(REL_X, &rel_bits)
-        && test_bit(REL_Y, &rel_bits)
-        && test_bit(BTN_LEFT, &key_bits)
-    {
-        return Some(DeviceKind::RelativeMouse);
-    }
-
-    None
 }

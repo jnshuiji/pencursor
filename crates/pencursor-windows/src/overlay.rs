@@ -179,10 +179,18 @@ impl OverlayRenderer {
             let dxgi_adapter = dxgi_device.GetAdapter()?;
             let dxgi_factory: IDXGIFactory2 = dxgi_adapter.GetParent()?;
 
-            let hover_swapchain =
-                Self::create_and_upload_sprite_swapchain(&dxgi_factory, &dxgi_device, &d3d_context, &hover_pixmap)?;
-            let contact_swapchain =
-                Self::create_and_upload_sprite_swapchain(&dxgi_factory, &dxgi_device, &d3d_context, &contact_pixmap)?;
+            let hover_swapchain = Self::create_and_upload_sprite_swapchain(
+                &dxgi_factory,
+                &dxgi_device,
+                &d3d_context,
+                &hover_pixmap,
+            )?;
+            let contact_swapchain = Self::create_and_upload_sprite_swapchain(
+                &dxgi_factory,
+                &dxgi_device,
+                &d3d_context,
+                &contact_pixmap,
+            )?;
 
             let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(Some(&dxgi_device))?;
             let dcomp_target = dcomp_device.CreateTargetForHwnd(hwnd, true)?;
@@ -242,8 +250,7 @@ impl OverlayRenderer {
 
         // SAFETY: Creates a 64x64 composition swap chain, copies the `vello_cpu` RGBA8 buffer into texture 0, and presents it once.
         unsafe {
-            let swapchain =
-                dxgi_factory.CreateSwapChainForComposition(dxgi_device, &desc, None)?;
+            let swapchain = dxgi_factory.CreateSwapChainForComposition(dxgi_device, &desc, None)?;
             let backbuffer: ID3D11Texture2D = swapchain.GetBuffer(0)?;
             let row_pitch = sprite_size * 4;
             d3d_context.UpdateSubresource(

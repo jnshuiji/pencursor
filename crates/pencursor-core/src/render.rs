@@ -21,7 +21,10 @@ pub const SPRITE_CENTER_OFFSET: f32 = (SPRITE_SIZE as f32) * 0.5;
 pub fn render_hover_sprite(config: &Config) -> Pixmap {
     let mut ctx = RenderContext::new(SPRITE_SIZE, SPRITE_SIZE);
     let mut resources = Resources::new();
-    let center = Point::new(f64::from(SPRITE_CENTER_OFFSET), f64::from(SPRITE_CENTER_OFFSET));
+    let center = Point::new(
+        f64::from(SPRITE_CENTER_OFFSET),
+        f64::from(SPRITE_CENTER_OFFSET),
+    );
 
     encode_hover_cursor(&mut ctx, center, config);
 
@@ -35,7 +38,10 @@ pub fn render_hover_sprite(config: &Config) -> Pixmap {
 pub fn render_contact_sprite(config: &Config) -> Pixmap {
     let mut ctx = RenderContext::new(SPRITE_SIZE, SPRITE_SIZE);
     let mut resources = Resources::new();
-    let center = Point::new(f64::from(SPRITE_CENTER_OFFSET), f64::from(SPRITE_CENTER_OFFSET));
+    let center = Point::new(
+        f64::from(SPRITE_CENTER_OFFSET),
+        f64::from(SPRITE_CENTER_OFFSET),
+    );
 
     encode_contact_cursor(&mut ctx, center, config);
 

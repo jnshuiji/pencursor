@@ -9,7 +9,7 @@ use pencursor_core::{Config, PlatformRuntime};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use pencursor_windows::WindowsRuntime;
 
-    let config = Config::default();
+    let config = Config::load_or_default(Config::resolve_config_path());
     WindowsRuntime::run(config)?;
     Ok(())
 }
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use pencursor_android::AndroidRuntime;
 
-    let config = Config::default();
+    let config = Config::load_or_default(Config::resolve_config_path());
     AndroidRuntime::run(config)?;
     Ok(())
 }

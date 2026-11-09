@@ -1,17 +1,18 @@
 //! Android KernelSU daemon runtime orchestrating `epoll`, `inotify`, `timerfd`, and `SurfaceFlinger`.
 
 use crate::evdev::EvdevManager;
-use crate::power::{GAOMON_USB_PID, GAOMON_USB_VID, apply_usb_power_policy};
+use crate::power::apply_usb_power_policy_with_config;
 use crate::surface::{DualSpriteOverlay, SurfaceError, detect_native_display_bounds};
 use crate::sys::{
-    CLOCK_MONOTONIC, EPOLL_CLOEXEC, EPOLLIN, EpollEvent, IN_ATTRIB, IN_CLOEXEC, IN_CREATE,
-    IN_DELETE, IN_NONBLOCK, OwnedFd, TFD_CLOEXEC, TFD_NONBLOCK, arm_oneshot_timerfd_ms,
-    disarm_timerfd, drain_timerfd, epoll_add, epoll_create1, epoll_wait, inotify_add_watch,
-    inotify_init1, read, set_process_name, timerfd_create,
+    CLOCK_MONOTONIC, EPOLL_CLOEXEC, EPOLLIN, EpollEvent, IN_ATTRIB, IN_CLOEXEC, IN_CLOSE_WRITE,
+    IN_CREATE, IN_DELETE, IN_MODIFY, IN_MOVED_TO, IN_NONBLOCK, OwnedFd, TFD_CLOEXEC, TFD_NONBLOCK,
+    arm_oneshot_timerfd_ms, disarm_timerfd, drain_timerfd, epoll_add, epoll_create1, epoll_wait,
+    inotify_add_watch, inotify_init1, read, set_process_name, timerfd_create,
 };
 use pencursor_core::{Config, OverlayBackend, PlatformRuntime, global_tracker};
 use std::ffi::{CString, c_int, c_void};
 use std::fmt;
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
@@ -36,6 +37,25 @@ impl From<SurfaceError> for AndroidRuntimeError {
     }
 }
 
+/// Registers `inotify` watches on the configuration file and its parent directory for live hot-reload.
+fn add_config_watches(inotify_fd: c_int, config_path: &Path) {
+    let watch_mask = IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_MODIFY | IN_ATTRIB;
+    if let Some(parent) = config_path.parent()
+        && let Ok(c_parent) = CString::new(parent.to_string_lossy().as_bytes())
+    {
+        // SAFETY: `c_parent` is a valid NUL-terminated path passed to `inotify_add_watch`.
+        unsafe {
+            let _ = inotify_add_watch(inotify_fd, c_parent.as_ptr(), watch_mask);
+        }
+    }
+    if let Ok(c_file) = CString::new(config_path.to_string_lossy().as_bytes()) {
+        // SAFETY: `c_file` is a valid NUL-terminated path passed to `inotify_add_watch`.
+        unsafe {
+            let _ = inotify_add_watch(inotify_fd, c_file.as_ptr(), watch_mask);
+        }
+    }
+}
+
 /// Android KernelSU daemon runtime implementation.
 #[derive(Debug, Default)]
 pub struct AndroidRuntime;
@@ -43,13 +63,23 @@ pub struct AndroidRuntime;
 impl PlatformRuntime for AndroidRuntime {
     type Error = AndroidRuntimeError;
 
-    fn run(config: Config) -> Result<(), Self::Error> {
-        set_process_name("pencursord");
+    fn run(mut config: Config) -> Result<(), Self::Error> {
+        set_process_name("pencursor");
+
+        let config_path = Config::resolve_config_path();
+        if config_path.exists() {
+            config = Config::load_or_default(&config_path);
+        }
+
+        if !config.daemon_enabled {
+            println!("[Info] PenCursor KernelSU Daemon 已在配置中禁用 (daemon_enabled=false)");
+            return Ok(());
+        }
 
         let tracker = global_tracker();
         tracker.configure_from(&config);
 
-        apply_usb_power_policy(GAOMON_USB_VID, GAOMON_USB_PID);
+        apply_usb_power_policy_with_config(&config.usb_power);
 
         let viewport = detect_native_display_bounds();
 
@@ -81,7 +111,7 @@ impl PlatformRuntime for AndroidRuntime {
         // SAFETY: `raw_epfd` is a valid newly created epoll descriptor.
         let epoll_fd = unsafe { OwnedFd::from_raw(raw_epfd) };
 
-        // SAFETY: Creates a non-blocking inotify descriptor watching `/dev/input`.
+        // SAFETY: Creates a non-blocking inotify descriptor watching `/dev/input` and `config.conf`.
         let raw_infd = unsafe { inotify_init1(IN_NONBLOCK | IN_CLOEXEC) };
         if raw_infd < 0 {
             return Err(AndroidRuntimeError("调用 inotify_init1 失败".to_string()));
@@ -98,6 +128,7 @@ impl PlatformRuntime for AndroidRuntime {
                 IN_CREATE | IN_DELETE | IN_ATTRIB,
             );
         }
+        add_config_watches(inotify_fd.raw(), &config_path);
 
         epoll_add(epoll_fd.raw(), inotify_fd.raw(), EPOLLIN, TAG_INOTIFY)
             .map_err(|e| AndroidRuntimeError(format!("注册 inotify 至 epoll 失败: {e}")))?;
@@ -114,11 +145,13 @@ impl PlatformRuntime for AndroidRuntime {
             .map_err(|e| AndroidRuntimeError(format!("注册 timerfd 至 epoll 失败: {e}")))?;
 
         let mut evdev_mgr = EvdevManager::new();
-        evdev_mgr.scan_and_register(epoll_fd.raw());
+        evdev_mgr.scan_and_register_with_config(epoll_fd.raw(), &config.usb_power);
 
         println!(
-            "[Info] PenCursor KernelSU Daemon 已启动 (Viewport: {}x{}, Overlay: 64x64 Dual-Layer SurfaceControl)",
-            viewport.width as u32, viewport.height as u32
+            "[Info] PenCursor KernelSU Daemon 已启动 (Viewport: {}x{}, Overlay: 64x64 Dual-Layer SurfaceControl, Config: {})",
+            viewport.width as u32,
+            viewport.height as u32,
+            config_path.display()
         );
 
         let mut events = [EpollEvent::default(); 16];
@@ -149,7 +182,7 @@ impl PlatformRuntime for AndroidRuntime {
             for ev in &events[..n_ready as usize] {
                 match ev.u64_data {
                     TAG_INOTIFY => {
-                        // Drain all queued inotify events and rescan `/dev/input` + USB power sysfs.
+                        // Drain all queued inotify events and check for config hot-reload + `/dev/input` rescan.
                         loop {
                             // SAFETY: Reads raw inotify events into a stack scratch buffer until EAGAIN.
                             let n = unsafe {
@@ -163,7 +196,45 @@ impl PlatformRuntime for AndroidRuntime {
                                 break;
                             }
                         }
-                        evdev_mgr.scan_and_register(epoll_fd.raw());
+
+                        add_config_watches(inotify_fd.raw(), &config_path);
+
+                        if config_path.exists()
+                            && let Ok(new_cfg) = Config::load_from_file(&config_path)
+                            && new_cfg != config
+                        {
+                            if !new_cfg.daemon_enabled {
+                                println!(
+                                    "[Info] 检测到配置 daemon_enabled=false，正在停止 PenCursor Daemon..."
+                                );
+                                return Ok(());
+                            }
+
+                            let visuals_changed = !new_cfg.visuals_eq(&config)
+                                || new_cfg.overlay_enabled != config.overlay_enabled;
+                            let power_changed = new_cfg.usb_power != config.usb_power;
+
+                            config = new_cfg;
+                            tracker.configure_from(&config);
+
+                            if visuals_changed {
+                                let _ = overlay.reload_sprites(&config);
+                                need_sync = true;
+                            }
+                            if power_changed {
+                                apply_usb_power_policy_with_config(&config.usb_power);
+                            }
+                        } else if config_path.exists()
+                            && !config.overlay_enabled
+                            && let Ok(new_cfg) = Config::load_from_file(&config_path)
+                            && new_cfg.overlay_enabled != config.overlay_enabled
+                        {
+                            config.overlay_enabled = new_cfg.overlay_enabled;
+                            let _ = overlay.reload_sprites(&config);
+                            need_sync = true;
+                        }
+
+                        evdev_mgr.scan_and_register_with_config(epoll_fd.raw(), &config.usb_power);
                     }
                     TAG_TIMER => {
                         let _ = drain_timerfd(timer_fd.raw());
@@ -188,7 +259,7 @@ impl PlatformRuntime for AndroidRuntime {
                 let snapshot = tracker.snapshot(config.hover_timeout_ms, false);
                 OverlayBackend::render_frame(&mut overlay, &snapshot, &config)?;
 
-                if snapshot.in_range {
+                if snapshot.in_range && config.overlay_enabled {
                     let _ = arm_oneshot_timerfd_ms(timer_fd.raw(), config.hover_timeout_ms + 5);
                     timer_armed = true;
                 } else if timer_armed {

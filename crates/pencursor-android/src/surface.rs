@@ -3,28 +3,33 @@
 //! Architecture:
 //! - Creates two `64x64` topmost click-through `SurfaceControl` sprite layers (`hover_layer`
 //!   and `contact_layer`).
-//! - Rasterizes and uploads the `Hover` and `Contact` vector sprites once at initialization
-//!   using Linebender `vello_cpu` and `ANativeWindow_lock` / `ANativeWindow_unlockAndPost`.
-//! - Performs zero runtime pixel writes or buffer locks: all cursor movement and
+//! - Rasterizes and uploads the `Hover` and `Contact` vector sprites at initialization and
+//!   on configuration reloads using Linebender `vello_cpu` and `ANativeWindow_lock` /
+//!   `ANativeWindow_unlockAndPost`.
+//! - Performs zero runtime pixel writes during motion: all cursor movement and
 //!   hover/contact transitions are executed exclusively via asynchronous (`oneWay`)
 //!   `SurfaceComposerClient::Transaction` (`setPosition`, `show`, `hide`).
 
-use crate::elf::find_elf64_dynsym_names;
-use crate::sys::{DlLib, set_thread_euid};
+mod abi;
+mod symbols;
+mod viewport;
+
+pub use viewport::detect_native_display_bounds;
+
+use crate::sys::set_thread_euid;
+use abi::{
+    ANativeWindowBuffer, CreateSurfaceVariant, LAYER_FLAG_SKIP_SCREENSHOT, LayerMetadataSlab,
+    PIXEL_FORMAT_RGBA_8888, TOPMOST_Z_ORDER, TransactionSlab, TxApplyVariant,
+    call_sret_create_surface, call_sret_sp1, extract_native_window,
+};
 use pencursor_core::{
     Config, OverlayBackend, Pixmap, SPRITE_CENTER_OFFSET, SPRITE_SIZE, StylusSnapshot,
-    ViewportBounds, render_contact_sprite, render_hover_sprite,
+    render_contact_sprite, render_hover_sprite,
 };
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CString, c_int, c_void};
 use std::fmt;
-use std::fs;
 use std::ptr;
-
-const PIXEL_FORMAT_RGBA_8888: i32 = 1;
-const LAYER_FLAG_SKIP_SCREENSHOT: u32 = 0x40;
-const TOPMOST_Z_ORDER: i32 = 0x3FFF_FFFF;
-const ANDROID_NATIVE_WINDOW_MAGIC: u32 = 0x5F77_6E64; // "_wnd"
-const ANDROID_NATIVE_WINDOW_MAGIC_UPPER: u32 = 0x5F57_4E44; // "_WND"
+use symbols::GuiSymbols;
 
 /// Error type for `SurfaceFlinger` overlay operations.
 #[derive(Debug, Clone)]
@@ -42,543 +47,6 @@ impl From<String> for SurfaceError {
     fn from(value: String) -> Self {
         Self(value)
     }
-}
-
-/// NDK `ANativeWindow_Buffer` layout (`<android/native_window.h>`).
-#[repr(C)]
-struct ANativeWindowBuffer {
-    width: i32,
-    height: i32,
-    stride: i32,
-    format: i32,
-    bits: *mut c_void,
-    reserved: [u32; 6],
-}
-
-impl Default for ANativeWindowBuffer {
-    fn default() -> Self {
-        Self {
-            width: 0,
-            height: 0,
-            stride: 0,
-            format: 0,
-            bits: ptr::null_mut(),
-            reserved: [0; 6],
-        }
-    }
-}
-
-/// 16-byte aligned 2048-byte oversized buffer for `SurfaceComposerClient::Transaction`.
-#[repr(C, align(16))]
-struct TransactionSlab([u64; 256]);
-
-impl Default for TransactionSlab {
-    fn default() -> Self {
-        Self([0u64; 256])
-    }
-}
-
-/// 16-byte aligned 256-byte oversized buffer for `gui::LayerMetadata`.
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Default)]
-struct LayerMetadataSlab([u64; 32]);
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CreateSurfaceVariant {
-    BinderParent(usize),
-    RawControlParent(usize),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum TxApplyVariant {
-    OneBool(usize),
-    TwoBools(usize),
-}
-
-/// Dynamically resolved symbol table from `libutils.so`, `libgui.so`, and `libandroid.so`.
-#[derive(Debug)]
-struct GuiSymbols {
-    _libutils: DlLib,
-    _libgui: DlLib,
-    _libandroid: DlLib,
-
-    string8_ctor: unsafe extern "C" fn(*mut c_void, *const c_char),
-    string8_dtor: unsafe extern "C" fn(*mut c_void),
-    refbase_inc: unsafe extern "C" fn(*mut c_void, *const c_void),
-    refbase_dec: unsafe extern "C" fn(*mut c_void, *const c_void),
-
-    scc_ctor: unsafe extern "C" fn(*mut c_void),
-    scc_init_check: unsafe extern "C" fn(*const c_void) -> i32,
-    scc_create_surface: CreateSurfaceVariant,
-    sc_get_surface: usize,
-
-    layer_meta_ctor: Option<unsafe extern "C" fn(*mut c_void)>,
-    layer_meta_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-
-    tx_ctor: unsafe extern "C" fn(*mut c_void),
-    tx_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-    tx_set_layer: unsafe extern "C" fn(*mut c_void, *const *mut c_void, i32) -> *mut c_void,
-    tx_set_pos:
-        Option<unsafe extern "C" fn(*mut c_void, *const *mut c_void, f32, f32) -> *mut c_void>,
-    tx_set_flags:
-        Option<unsafe extern "C" fn(*mut c_void, *const *mut c_void, u32, u32) -> *mut c_void>,
-    tx_set_layer_stack:
-        Option<unsafe extern "C" fn(*mut c_void, *const *mut c_void, u32) -> *mut c_void>,
-    tx_set_trusted_overlay_bool:
-        Option<unsafe extern "C" fn(*mut c_void, *const *mut c_void, bool) -> *mut c_void>,
-    tx_set_trusted_overlay_enum:
-        Option<unsafe extern "C" fn(*mut c_void, *const *mut c_void, i32) -> *mut c_void>,
-    tx_set_drop_input_mode:
-        Option<unsafe extern "C" fn(*mut c_void, *const *mut c_void, u32) -> *mut c_void>,
-    tx_show: Option<unsafe extern "C" fn(*mut c_void, *const *mut c_void) -> *mut c_void>,
-    tx_hide: Option<unsafe extern "C" fn(*mut c_void, *const *mut c_void) -> *mut c_void>,
-    tx_apply: TxApplyVariant,
-
-    anw_acquire: unsafe extern "C" fn(*mut c_void),
-    anw_release: unsafe extern "C" fn(*mut c_void),
-    anw_set_geometry: unsafe extern "C" fn(*mut c_void, i32, i32, i32) -> i32,
-    anw_lock: unsafe extern "C" fn(*mut c_void, *mut ANativeWindowBuffer, *mut c_void) -> i32,
-    anw_unlock_and_post: unsafe extern "C" fn(*mut c_void) -> i32,
-}
-
-impl GuiSymbols {
-    fn resolve() -> Result<Self, String> {
-        let libutils = DlLib::open("/system/lib64/libutils.so")
-            .or_else(|_| DlLib::open("libutils.so"))?;
-        let libgui =
-            DlLib::open("/system/lib64/libgui.so").or_else(|_| DlLib::open("libgui.so"))?;
-        let libandroid = DlLib::open("/system/lib64/libandroid.so")
-            .or_else(|_| DlLib::open("libandroid.so"))?;
-
-        // SAFETY: All transmuted function pointers match AOSP Itanium C++ ABI and NDK C ABI signatures.
-        unsafe {
-            let string8_ctor = core::mem::transmute::<
-                usize,
-                unsafe extern "C" fn(*mut c_void, *const c_char),
-            >(
-                libutils
-                    .sym("_ZN7android7String8C1EPKc")
-                    .or_else(|| libutils.sym("_ZN7android7String8C2EPKc"))
-                    .ok_or("missing String8::String8(char const*)")?,
-            );
-            let string8_dtor =
-                core::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(
-                    libutils
-                        .sym("_ZN7android7String8D1Ev")
-                        .or_else(|| libutils.sym("_ZN7android7String8D2Ev"))
-                        .ok_or("missing String8::~String8()")?,
-                );
-            let refbase_inc = core::mem::transmute::<
-                usize,
-                unsafe extern "C" fn(*mut c_void, *const c_void),
-            >(
-                libutils
-                    .sym("_ZNK7android7RefBase9incStrongEPKv")
-                    .ok_or("missing RefBase::incStrong")?,
-            );
-            let refbase_dec = core::mem::transmute::<
-                usize,
-                unsafe extern "C" fn(*mut c_void, *const c_void),
-            >(
-                libutils
-                    .sym("_ZNK7android7RefBase9decStrongEPKv")
-                    .ok_or("missing RefBase::decStrong")?,
-            );
-
-            let scc_ctor = core::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(
-                libgui
-                    .sym("_ZN7android21SurfaceComposerClientC1Ev")
-                    .or_else(|| libgui.sym("_ZN7android21SurfaceComposerClientC2Ev"))
-                    .ok_or("missing SurfaceComposerClient::SurfaceComposerClient()")?,
-            );
-            let scc_init_check =
-                core::mem::transmute::<usize, unsafe extern "C" fn(*const c_void) -> i32>(
-                    libgui
-                        .sym("_ZNK7android21SurfaceComposerClient9initCheckEv")
-                        .ok_or("missing SurfaceComposerClient::initCheck()")?,
-                );
-
-            let scc_create_surface = Self::resolve_create_surface(&libgui)?;
-
-            let sc_get_surface = libgui
-                .sym("_ZN7android14SurfaceControl10getSurfaceEv")
-                .or_else(|| libgui.sym("_ZNK7android14SurfaceControl10getSurfaceEv"))
-                .ok_or("missing SurfaceControl::getSurface()")?;
-
-            let layer_meta_ctor = libgui
-                .sym("_ZN7android3gui13LayerMetadataC1Ev")
-                .or_else(|| libgui.sym("_ZN7android13LayerMetadataC1Ev"))
-                .or_else(|| libgui.sym("_ZN7android3gui13LayerMetadataC2Ev"))
-                .or_else(|| libgui.sym("_ZN7android13LayerMetadataC2Ev"))
-                .map(|p| core::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(p));
-
-            let layer_meta_dtor = libgui
-                .sym("_ZN7android3gui13LayerMetadataD1Ev")
-                .or_else(|| libgui.sym("_ZN7android13LayerMetadataD1Ev"))
-                .or_else(|| libgui.sym("_ZN7android3gui13LayerMetadataD2Ev"))
-                .or_else(|| libgui.sym("_ZN7android13LayerMetadataD2Ev"))
-                .map(|p| core::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(p));
-
-            let tx_ctor = core::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(
-                libgui
-                    .sym("_ZN7android21SurfaceComposerClient11TransactionC1Ev")
-                    .or_else(|| libgui.sym("_ZN7android21SurfaceComposerClient11TransactionC2Ev"))
-                    .ok_or("missing Transaction::Transaction()")?,
-            );
-            let tx_dtor = libgui
-                .sym("_ZN7android21SurfaceComposerClient11TransactionD1Ev")
-                .or_else(|| libgui.sym("_ZN7android21SurfaceComposerClient11TransactionD2Ev"))
-                .map(|p| core::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(p));
-            let tx_set_layer = core::mem::transmute::<
-                usize,
-                unsafe extern "C" fn(*mut c_void, *const *mut c_void, i32) -> *mut c_void,
-            >(
-                libgui
-                    .sym("_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi")
-                    .ok_or("missing Transaction::setLayer")?,
-            );
-            let tx_set_pos = libgui
-                .sym("_ZN7android21SurfaceComposerClient11Transaction11setPositionERKNS_2spINS_14SurfaceControlEEEff")
-                .map(|p| {
-                    core::mem::transmute::<
-                        usize,
-                        unsafe extern "C" fn(*mut c_void, *const *mut c_void, f32, f32) -> *mut c_void,
-                    >(p)
-                });
-            let tx_set_flags = libgui
-                .sym("_ZN7android21SurfaceComposerClient11Transaction8setFlagsERKNS_2spINS_14SurfaceControlEEEjj")
-                .map(|p| {
-                    core::mem::transmute::<
-                        usize,
-                        unsafe extern "C" fn(*mut c_void, *const *mut c_void, u32, u32) -> *mut c_void,
-                    >(p)
-                });
-            let tx_set_layer_stack = libgui
-                .sym("_ZN7android21SurfaceComposerClient11Transaction13setLayerStackERKNS_2spINS_14SurfaceControlEEEj")
-                .or_else(|| {
-                    libgui.sym("_ZN7android21SurfaceComposerClient11Transaction13setLayerStackERKNS_2spINS_14SurfaceControlEEENS_2ui10LayerStackE")
-                })
-                .map(|p| {
-                    core::mem::transmute::<
-                        usize,
-                        unsafe extern "C" fn(*mut c_void, *const *mut c_void, u32) -> *mut c_void,
-                    >(p)
-                });
-            let tx_set_trusted_overlay_bool = libgui
-                .sym("_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb")
-                .map(|p| {
-                    core::mem::transmute::<
-                        usize,
-                        unsafe extern "C" fn(*mut c_void, *const *mut c_void, bool) -> *mut c_void,
-                    >(p)
-                });
-            let tx_set_trusted_overlay_enum = libgui
-                .sym("_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEENS_3gui14TrustedOverlayE")
-                .map(|p| {
-                    core::mem::transmute::<
-                        usize,
-                        unsafe extern "C" fn(*mut c_void, *const *mut c_void, i32) -> *mut c_void,
-                    >(p)
-                });
-            let tx_set_drop_input_mode = libgui
-                .sym("_ZN7android21SurfaceComposerClient11Transaction16setDropInputModeERKNS_2spINS_14SurfaceControlEEENS_3gui13DropInputModeE")
-                .map(|p| {
-                    core::mem::transmute::<
-                        usize,
-                        unsafe extern "C" fn(*mut c_void, *const *mut c_void, u32) -> *mut c_void,
-                    >(p)
-                });
-            let tx_show = libgui
-                .sym("_ZN7android21SurfaceComposerClient11Transaction4showERKNS_2spINS_14SurfaceControlEEE")
-                .map(|p| {
-                    core::mem::transmute::<
-                        usize,
-                        unsafe extern "C" fn(*mut c_void, *const *mut c_void) -> *mut c_void,
-                    >(p)
-                });
-            let tx_hide = libgui
-                .sym("_ZN7android21SurfaceComposerClient11Transaction4hideERKNS_2spINS_14SurfaceControlEEE")
-                .map(|p| {
-                    core::mem::transmute::<
-                        usize,
-                        unsafe extern "C" fn(*mut c_void, *const *mut c_void) -> *mut c_void,
-                    >(p)
-                });
-
-            let tx_apply = if let Some(p) =
-                libgui.sym("_ZN7android21SurfaceComposerClient11Transaction5applyEbb")
-            {
-                TxApplyVariant::TwoBools(p)
-            } else if let Some(p) =
-                libgui.sym("_ZN7android21SurfaceComposerClient11Transaction5applyEb")
-            {
-                TxApplyVariant::OneBool(p)
-            } else {
-                return Err("missing Transaction::apply".to_string());
-            };
-
-            let anw_acquire =
-                core::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(
-                    libandroid
-                        .sym("ANativeWindow_acquire")
-                        .ok_or("missing ANativeWindow_acquire")?,
-                );
-            let anw_release =
-                core::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(
-                    libandroid
-                        .sym("ANativeWindow_release")
-                        .ok_or("missing ANativeWindow_release")?,
-                );
-            let anw_set_geometry = core::mem::transmute::<
-                usize,
-                unsafe extern "C" fn(*mut c_void, i32, i32, i32) -> i32,
-            >(
-                libandroid
-                    .sym("ANativeWindow_setBuffersGeometry")
-                    .ok_or("missing ANativeWindow_setBuffersGeometry")?,
-            );
-            let anw_lock = core::mem::transmute::<
-                usize,
-                unsafe extern "C" fn(*mut c_void, *mut ANativeWindowBuffer, *mut c_void) -> i32,
-            >(
-                libandroid
-                    .sym("ANativeWindow_lock")
-                    .ok_or("missing ANativeWindow_lock")?,
-            );
-            let anw_unlock_and_post =
-                core::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void) -> i32>(
-                    libandroid
-                        .sym("ANativeWindow_unlockAndPost")
-                        .ok_or("missing ANativeWindow_unlockAndPost")?,
-                );
-
-            Ok(Self {
-                _libutils: libutils,
-                _libgui: libgui,
-                _libandroid: libandroid,
-                string8_ctor,
-                string8_dtor,
-                refbase_inc,
-                refbase_dec,
-                scc_ctor,
-                scc_init_check,
-                scc_create_surface,
-                sc_get_surface,
-                layer_meta_ctor,
-                layer_meta_dtor,
-                tx_ctor,
-                tx_dtor,
-                tx_set_layer,
-                tx_set_pos,
-                tx_set_flags,
-                tx_set_layer_stack,
-                tx_set_trusted_overlay_bool,
-                tx_set_trusted_overlay_enum,
-                tx_set_drop_input_mode,
-                tx_show,
-                tx_hide,
-                tx_apply,
-                anw_acquire,
-                anw_release,
-                anw_set_geometry,
-                anw_lock,
-                anw_unlock_and_post,
-            })
-        }
-    }
-
-    fn resolve_create_surface(libgui: &DlLib) -> Result<CreateSurfaceVariant, String> {
-        let binder_candidates = [
-            "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj",
-            "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj",
-            "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_13LayerMetadataEPj",
-            "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_13LayerMetadataEPj",
-        ];
-        for sym in binder_candidates {
-            if let Some(addr) = libgui.sym(sym) {
-                return Ok(CreateSurfaceVariant::BinderParent(addr));
-            }
-        }
-
-        let raw_candidates = [
-            "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiPNS_14SurfaceControlENS_3gui13LayerMetadataEPj",
-            "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlENS_13LayerMetadataEPj",
-            "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiPNS_14SurfaceControlENS_13LayerMetadataEPj",
-        ];
-        for sym in raw_candidates {
-            if let Some(addr) = libgui.sym(sym) {
-                return Ok(CreateSurfaceVariant::RawControlParent(addr));
-            }
-        }
-
-        let sniffed = find_elf64_dynsym_names("/system/lib64/libgui.so", |name| {
-            name.starts_with("_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8E")
-        });
-        for name in sniffed {
-            if let Some(addr) = libgui.sym(&name) {
-                if name.contains("IBinder") {
-                    return Ok(CreateSurfaceVariant::BinderParent(addr));
-                } else {
-                    return Ok(CreateSurfaceVariant::RawControlParent(addr));
-                }
-            }
-        }
-
-        Err("unable to resolve SurfaceComposerClient::createSurface in libgui.so".to_string())
-    }
-}
-
-/// AArch64 AAPCS64 `x8` (`sret`) trampoline for single-argument member functions returning `android::sp<T>`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn call_sret_sp1(func: usize, this_x0: *mut c_void) -> *mut c_void {
-    let mut out_sp: *mut c_void = ptr::null_mut();
-    // SAFETY: Passes `&mut out_sp` in `x8` per AArch64 Itanium C++ ABI for non-trivial `sp<T>` return.
-    unsafe {
-        core::arch::asm!(
-            "blr {func}",
-            func = in(reg) func,
-            in("x8") &raw mut out_sp,
-            inout("x0") this_x0 => _,
-            clobber_abi("C"),
-        );
-    }
-    out_sp
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-#[inline(always)]
-unsafe fn call_sret_sp1(_func: usize, _this_x0: *mut c_void) -> *mut c_void {
-    ptr::null_mut()
-}
-
-/// AArch64 AAPCS64 `x8` (`sret`) trampoline for `SurfaceComposerClient::createSurface`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn call_sret_create_surface(
-    func: usize,
-    this_x0: *mut c_void,
-    name_x1: *const c_void,
-    width_w2: u32,
-    height_w3: u32,
-    format_w4: i32,
-    flags_w5: u32,
-    parent_x6: *const c_void,
-    meta_x7: *mut c_void,
-    out_hint_sp0: *mut u32,
-) -> *mut c_void {
-    let mut out_sp: *mut c_void = ptr::null_mut();
-    // SAFETY: Allocates 16-byte aligned stack slot for the 9th parameter (`outTransformHint`) and binds `x8` for `sp<SurfaceControl>`.
-    unsafe {
-        core::arch::asm!(
-            "sub sp, sp, #16",
-            "str {hint}, [sp]",
-            "blr {func}",
-            "add sp, sp, #16",
-            func = in(reg) func,
-            hint = in(reg) out_hint_sp0,
-            in("x8") &raw mut out_sp,
-            inout("x0") this_x0 => _,
-            in("x1") name_x1,
-            in("w2") width_w2,
-            in("w3") height_w3,
-            in("w4") format_w4,
-            in("w5") flags_w5,
-            in("x6") parent_x6,
-            in("x7") meta_x7,
-            clobber_abi("C"),
-        );
-    }
-    out_sp
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn call_sret_create_surface(
-    _func: usize,
-    _this_x0: *mut c_void,
-    _name_x1: *const c_void,
-    _width_w2: u32,
-    _height_w3: u32,
-    _format_w4: i32,
-    _flags_w5: u32,
-    _parent_x6: *const c_void,
-    _meta_x7: *mut c_void,
-    _out_hint_sp0: *mut u32,
-) -> *mut c_void {
-    ptr::null_mut()
-}
-
-/// Scans the `android::Surface` object header for the `_WND` / `_wnd` magic to locate the embedded `ANativeWindow*`.
-unsafe fn extract_native_window(surface_ptr: *mut c_void) -> Option<*mut c_void> {
-    if surface_ptr.is_null() {
-        return None;
-    }
-    let base = surface_ptr.cast::<u8>();
-    for off in (0..128).step_by(8) {
-        // SAFETY: `android::Surface` is >128 bytes and 8-byte aligned.
-        unsafe {
-            let ptr_at_off = base.add(off);
-            let magic = *ptr_at_off.cast::<u32>();
-            if magic == ANDROID_NATIVE_WINDOW_MAGIC || magic == ANDROID_NATIVE_WINDOW_MAGIC_UPPER {
-                return Some(ptr_at_off.cast::<c_void>());
-            }
-        }
-    }
-    None
-}
-
-/// Detects the native physical display viewport bounds (e.g., `2400x3392` Portrait panel on OnePlus Pad 3 Pro).
-pub fn detect_native_display_bounds() -> ViewportBounds {
-    // 1. Prefer DRM DSI connector mode (reports native panel Portrait resolution `2400x3392`).
-    if let Ok(entries) = fs::read_dir("/sys/class/drm") {
-        for e in entries.flatten() {
-            let name = e.file_name();
-            let s = name.to_string_lossy();
-            if s.contains("DSI") || s.contains("dsi") || s.contains("panel") {
-                let mode_path = e.path().join("modes");
-                if let Ok(txt) = fs::read_to_string(mode_path) {
-                    for line in txt.lines() {
-                        let clean = line.trim().split(['-', '@', ' ']).next().unwrap_or("");
-                        let mut it = clean.split('x');
-                        if let (Some(a), Some(b)) = (it.next(), it.next())
-                            && let (Ok(w), Ok(h)) = (a.parse::<u32>(), b.parse::<u32>())
-                            && w >= 480
-                            && h >= 480
-                        {
-                            return ViewportBounds::new(0.0, 0.0, w as f32, h as f32);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Fallback to `/system/bin/wm size`.
-    if let Ok(output) = std::process::Command::new("/system/bin/wm")
-        .arg("size")
-        .output()
-    {
-        let txt = String::from_utf8_lossy(&output.stdout);
-        for line in txt.lines() {
-            if let Some(pos) = line.find(':') {
-                let val_part = line[pos + 1..].trim();
-                let mut it = val_part.split('x');
-                if let (Some(a), Some(b)) = (it.next(), it.next())
-                    && let (Ok(w), Ok(h)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>())
-                    && w >= 480
-                    && h >= 480
-                {
-                    return ViewportBounds::new(0.0, 0.0, w as f32, h as f32);
-                }
-            }
-        }
-    }
-
-    // 3. Default baseline for OnePlus Pad 3 Pro (2400x3392 native portrait frame).
-    ViewportBounds::new(0.0, 0.0, 2400.0, 3392.0)
 }
 
 /// Represents a single `64x64` hardware sprite layer in `SurfaceFlinger`.
@@ -780,30 +248,13 @@ impl DualSpriteOverlay {
                 PIXEL_FORMAT_RGBA_8888,
             );
 
-            // Upload the pre-rendered 64x64 RGBA8888 pixmap once via ANativeWindow_lock.
-            let mut buf = ANativeWindowBuffer::default();
-            let lock_rc = (syms.anw_lock)(native_window, &raw mut buf, ptr::null_mut());
-            if lock_rc != 0 || buf.bits.is_null() {
+            if let Err(e) = Self::upload_pixmap_to_window(syms, native_window, name, pixmap) {
                 (syms.anw_release)(native_window);
                 (syms.refbase_dec)(surface_ptr, surface_ptr);
                 (syms.refbase_dec)(control_ptr, control_ptr);
-                return Err(format!("ANativeWindow_lock({name}) failed: {lock_rc}"));
+                return Err(e);
             }
 
-            let src_bytes = pixmap.data_as_u8_slice();
-            let dst_base = buf.bits.cast::<u8>();
-            let row_bytes = usize::from(SPRITE_SIZE) * 4;
-            let dst_stride_bytes = (buf.stride.max(sprite_size_u32 as i32) as usize) * 4;
-
-            for y in 0..usize::from(SPRITE_SIZE) {
-                let src_row = src_bytes.as_ptr().add(y * row_bytes);
-                let dst_row = dst_base.add(y * dst_stride_bytes);
-                ptr::copy_nonoverlapping(src_row, dst_row, row_bytes);
-            }
-
-            let _ = (syms.anw_unlock_and_post)(native_window);
-
-            // Configure Z-order, input pass-through (`DropInputMode::ALL`), trusted overlay, and initial hidden state.
             let mut tx = TransactionSlab::default();
             let tx_ptr = (&raw mut tx).cast::<c_void>();
             (syms.tx_ctor)(tx_ptr);
@@ -821,6 +272,37 @@ impl DualSpriteOverlay {
                 surface_ptr,
                 native_window,
             })
+        }
+    }
+
+    unsafe fn upload_pixmap_to_window(
+        syms: &GuiSymbols,
+        native_window: *mut c_void,
+        name: &str,
+        pixmap: &Pixmap,
+    ) -> Result<(), String> {
+        let sprite_size_u32 = u32::from(SPRITE_SIZE);
+        // SAFETY: Locks `native_window`, copies the 64x64 premultiplied RGBA8888 pixmap into the graphic buffer, and posts it.
+        unsafe {
+            let mut buf = ANativeWindowBuffer::default();
+            let lock_rc = (syms.anw_lock)(native_window, &raw mut buf, ptr::null_mut());
+            if lock_rc != 0 || buf.bits.is_null() {
+                return Err(format!("ANativeWindow_lock({name}) failed: {lock_rc}"));
+            }
+
+            let src_bytes = pixmap.data_as_u8_slice();
+            let dst_base = buf.bits.cast::<u8>();
+            let row_bytes = usize::from(SPRITE_SIZE) * 4;
+            let dst_stride_bytes = (buf.stride.max(sprite_size_u32 as i32) as usize) * 4;
+
+            for y in 0..usize::from(SPRITE_SIZE) {
+                let src_row = src_bytes.as_ptr().add(y * row_bytes);
+                let dst_row = dst_base.add(y * dst_stride_bytes);
+                ptr::copy_nonoverlapping(src_row, dst_row, row_bytes);
+            }
+
+            let _ = (syms.anw_unlock_and_post)(native_window);
+            Ok(())
         }
     }
 
@@ -904,10 +386,10 @@ impl DualSpriteOverlay {
         unsafe {
             match syms.tx_apply {
                 TxApplyVariant::OneBool(f) => {
-                    let func =
-                        core::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void, bool) -> i32>(
-                            f,
-                        );
+                    let func = core::mem::transmute::<
+                        usize,
+                        unsafe extern "C" fn(*mut c_void, bool) -> i32,
+                    >(f);
                     let _ = func(tx_ptr, false);
                 }
                 TxApplyVariant::TwoBools(f) => {
@@ -1038,6 +520,46 @@ impl DualSpriteOverlay {
         self.last_x = top_left_x;
         self.last_y = top_left_y;
     }
+
+    /// Re-rasterizes the `64x64` `Hover` and `Contact` sprites with `vello_cpu` and uploads them
+    /// in-place to the active `SurfaceControl` `ANativeWindow` buffers without recreating layers.
+    pub fn reload_sprites(&mut self, config: &Config) -> Result<(), SurfaceError> {
+        let hover_pixmap = render_hover_sprite(config);
+        let contact_pixmap = render_contact_sprite(config);
+
+        // SAFETY: `self.hover_layer.native_window` and `self.contact_layer.native_window` are valid acquired `ANativeWindow` pointers.
+        unsafe {
+            Self::upload_pixmap_to_window(
+                &self.syms,
+                self.hover_layer.native_window,
+                "PenCursorHover",
+                &hover_pixmap,
+            )
+            .map_err(SurfaceError)?;
+            Self::upload_pixmap_to_window(
+                &self.syms,
+                self.contact_layer.native_window,
+                "PenCursorContact",
+                &contact_pixmap,
+            )
+            .map_err(SurfaceError)?;
+        }
+
+        if !config.overlay_enabled {
+            let hidden = StylusSnapshot {
+                in_range: false,
+                ..StylusSnapshot::default()
+            };
+            self.update_cursor(&hidden);
+        } else {
+            // Force redraw/recommit on next coordinate update by invalidating cached sprite state
+            self.active_sprite = ActiveSprite::None;
+            self.last_x = f32::NAN;
+            self.last_y = f32::NAN;
+        }
+
+        Ok(())
+    }
 }
 
 impl OverlayBackend for DualSpriteOverlay {
@@ -1047,9 +569,17 @@ impl OverlayBackend for DualSpriteOverlay {
     fn render_frame(
         &mut self,
         snapshot: &StylusSnapshot,
-        _config: &Config,
+        config: &Config,
     ) -> Result<(), Self::Error> {
-        self.update_cursor(snapshot);
+        if !config.overlay_enabled {
+            let hidden = StylusSnapshot {
+                in_range: false,
+                ..*snapshot
+            };
+            self.update_cursor(&hidden);
+        } else {
+            self.update_cursor(snapshot);
+        }
         Ok(())
     }
 }

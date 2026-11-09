@@ -100,8 +100,7 @@ pub fn process_wm_input(lparam: LPARAM) {
 
             // SAFETY: Reads the `usButtonFlags` field from the `RAWMOUSE` union.
             let btn_flags = unsafe { u32::from(mouse.Anonymous.Anonymous.usButtonFlags) };
-            let btn_down =
-                (btn_flags & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_BUTTON_1_DOWN)) != 0;
+            let btn_down = (btn_flags & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_BUTTON_1_DOWN)) != 0;
             let btn_up = (btn_flags & (RI_MOUSE_LEFT_BUTTON_UP | RI_MOUSE_BUTTON_1_UP)) != 0;
             let key_down = is_left_button_pressed();
 

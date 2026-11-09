@@ -13,9 +13,12 @@ pub const TFD_NONBLOCK: c_int = 0o4000;
 
 pub const IN_NONBLOCK: c_int = 0o4000;
 pub const IN_CLOEXEC: c_int = 0o2000000;
+pub const IN_MODIFY: u32 = 0x0000_0002;
+pub const IN_ATTRIB: u32 = 0x0000_0004;
+pub const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+pub const IN_MOVED_TO: u32 = 0x0000_0080;
 pub const IN_CREATE: u32 = 0x0000_0100;
 pub const IN_DELETE: u32 = 0x0000_0200;
-pub const IN_ATTRIB: u32 = 0x0000_0004;
 
 pub const O_RDONLY: c_int = 0;
 pub const O_NONBLOCK: c_int = 0o4000;
