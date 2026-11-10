@@ -59,12 +59,6 @@ impl EvdevManager {
         }
     }
 
-    /// Scans `/dev/input`, enforces default USB power policy on matching tablets, and registers any new
-    /// stylus digitizer or mouse nodes with `epoll_fd`.
-    pub fn scan_and_register(&mut self, epoll_fd: c_int) {
-        self.scan_and_register_with_config(epoll_fd, &UsbPowerConfig::default());
-    }
-
     /// Scans `/dev/input`, enforces [`UsbPowerConfig`] on matching tablets, and registers any new
     /// stylus digitizer or mouse nodes with `epoll_fd`.
     pub fn scan_and_register_with_config(&mut self, epoll_fd: c_int, usb_power: &UsbPowerConfig) {

@@ -7,23 +7,6 @@ use pencursor_core::UsbPowerConfig;
 use std::fs;
 use std::path::Path;
 
-/// Default Huion / Gaomon USB Vendor ID (`0x256c`).
-pub const GAOMON_USB_VID: &str = "256c";
-
-/// Default Gaomon Tablet_M8 USB Product ID (`0x0064`).
-pub const GAOMON_USB_PID: &str = "0064";
-
-/// Applies global USB autosuspend overrides, OEM OTG switch state, and per-device runtime power
-/// policies for matching USB digitizer peripherals using default switches.
-pub fn apply_usb_power_policy(target_vid: &str, target_pid: &str) {
-    let cfg = UsbPowerConfig {
-        usb_vid: target_vid.to_string(),
-        usb_pid: target_pid.to_string(),
-        ..UsbPowerConfig::default()
-    };
-    apply_usb_power_policy_with_config(&cfg);
-}
-
 /// Applies USB and OTG runtime power policies according to [`UsbPowerConfig`].
 pub fn apply_usb_power_policy_with_config(cfg: &UsbPowerConfig) {
     // 1. Configure global usbcore autosuspend timer.

@@ -67,9 +67,6 @@ impl PlatformRuntime for AndroidRuntime {
         set_process_name("pencursor");
 
         let config_path = Config::resolve_config_path();
-        if config_path.exists() {
-            config = Config::load_or_default(&config_path);
-        }
 
         if !config.daemon_enabled {
             println!("[Info] PenCursor KernelSU Daemon 已在配置中禁用 (daemon_enabled=false)");
@@ -224,14 +221,6 @@ impl PlatformRuntime for AndroidRuntime {
                             if power_changed {
                                 apply_usb_power_policy_with_config(&config.usb_power);
                             }
-                        } else if config_path.exists()
-                            && !config.overlay_enabled
-                            && let Ok(new_cfg) = Config::load_from_file(&config_path)
-                            && new_cfg.overlay_enabled != config.overlay_enabled
-                        {
-                            config.overlay_enabled = new_cfg.overlay_enabled;
-                            let _ = overlay.reload_sprites(&config);
-                            need_sync = true;
                         }
 
                         evdev_mgr.scan_and_register_with_config(epoll_fd.raw(), &config.usb_power);
